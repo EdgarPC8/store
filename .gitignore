@@ -1,24 +1,23 @@
 # Dependencias
 backend/node_modules/
-frontend/node_modules/
 
 # Variables de entorno
 .env
-.env.*
+.env.local
+.env.*.local
 !.env.example
 backend/.env
-frontend/.env
 
-# Build frontend (artefactos generados / compilación)
-frontend/dist/
-frontend/assets/
-frontend/index.html
+# El frontend de desarrollo es el de eddeli/frontend (npm run store).
+# Compilación de producción: copiá el build fuera o a un docroot /store/.
 
 # Datos sensibles / backups locales
 backend/src/database/backup.json
 backend/src/backups/
 backend/database.db
 *.backup.json
+# Dump completo de producción (incluye users/hashes); el catálogo limpio sí se versiona
+backup-tienda.json
 
 # Sistema
 .DS_Store
