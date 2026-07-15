@@ -10,25 +10,26 @@ const IMG_BASE = path.resolve(__dirname, "../img");
 
 export const DEFAULT_APP_SETTINGS = {
   id: 1,
-  name: "EdDeli - Panadería, Pastelería y Repostería",
-  alias: "EdDeli",
+  name: "Raptor",
+  alias: "Raptor",
   version: "1.0.0",
-  description: "Sistema de Gestión de Negocios",
-  author: "SoftEd",
-  logoPath: "sistema/logos/logo.jpeg",
-  phone: "0969236901",
-  socialWhatsapp: "https://wa.me/593969236901",
-  socialFacebook: "https://facebook.com/profile.php?id=61581806494763",
-  socialInstagram: "https://instagram.com/panaderia_eddeli",
-  socialTiktok: "https://tiktok.com/@panaderia_eddeli",
-  socialEmail: "panaderiaeddeli@gmail.com",
+  description: "Aplicación sin configurar. Definí nombre, logo y opciones en Sistema → Configuración.",
+  author: "Raptor",
+  logoPath: null,
+  iconPath: null,
+  phone: "",
+  socialWhatsapp: "",
+  socialFacebook: "",
+  socialInstagram: "",
+  socialTiktok: "",
+  socialEmail: "",
   mediaFolderPrefix: "sistema",
-  cajaQuickCategoryMatch: "panader",
+  cajaQuickCategoryMatch: "",
   walkInCustomerLabel: "Consumidor Final",
   timezone: "America/Guayaquil",
-  showPublicCatalog: true,
-  showPublicStoresPropia: true,
-  showPublicStoresVitrina: true,
+  showPublicCatalog: false,
+  showPublicStoresPropia: false,
+  showPublicStoresVitrina: false,
 };
 
 let cache = { ...DEFAULT_APP_SETTINGS };
@@ -51,6 +52,10 @@ export function logosFolder() {
   return mediaSubfolder("logos");
 }
 
+export function iconsFolder() {
+  return mediaSubfolder("icons");
+}
+
 export function qrFolder() {
   return mediaSubfolder("qr");
 }
@@ -59,29 +64,61 @@ export function defaultLogoPath(prefix = mediaFolderPrefix()) {
   return `${prefix}/logos/logo.jpeg`;
 }
 
+export function defaultIconPath(prefix = mediaFolderPrefix()) {
+  return `${prefix}/icons/icon.jpeg`;
+}
+
 function ensureDirRel(rel) {
   if (!rel) return;
   fs.mkdirSync(path.join(IMG_BASE, rel), { recursive: true });
 }
 
-/** Carpetas estándar: {prefix}/logos y {prefix}/qr */
+/** Carpetas estándar: {prefix}/logos, {prefix}/icons y {prefix}/qr */
 export function ensureStandardAssetDirs(prefix = mediaFolderPrefix()) {
   ensureDirRel(`${prefix}/logos`);
+  ensureDirRel(`${prefix}/icons`);
   ensureDirRel(`${prefix}/qr`);
 }
 
 async function migrateSettingsRow(row) {
   const prefix = String(row.mediaFolderPrefix || "sistema").trim() || "sistema";
-  const canonicalLogo = `${prefix}/logos/logo.jpeg`;
   const patch = {};
 
-  if (
-    !row.logoPath ||
+  const alias = String(row.alias || "").trim();
+  const name = String(row.name || "").trim();
+  const author = String(row.author || "").trim();
+  const stillEddeliTemplate =
+    /^eddeli$/i.test(alias) ||
+    /eddeli/i.test(name) ||
+    /panader/i.test(name) ||
+    /^softed$/i.test(author);
+
+  // Clonado desde EdDeli: volver a plantilla Raptor sin configurar.
+  if (stillEddeliTemplate) {
+    Object.assign(patch, {
+      name: DEFAULT_APP_SETTINGS.name,
+      alias: DEFAULT_APP_SETTINGS.alias,
+      description: DEFAULT_APP_SETTINGS.description,
+      author: DEFAULT_APP_SETTINGS.author,
+      logoPath: null,
+      iconPath: null,
+      phone: "",
+      socialWhatsapp: "",
+      socialFacebook: "",
+      socialInstagram: "",
+      socialTiktok: "",
+      socialEmail: "",
+      cajaQuickCategoryMatch: "",
+      showPublicCatalog: false,
+      showPublicStoresPropia: false,
+      showPublicStoresVitrina: false,
+    });
+  } else if (
     row.logoPath === `${prefix}/logo.jpeg` ||
     row.logoPath === "EdDeli/logo.jpeg" ||
     row.logoPath === "EdDeli/logos/logo.jpeg"
   ) {
-    patch.logoPath = canonicalLogo;
+    patch.logoPath = null;
   }
 
   const tz = row.timezone != null ? String(row.timezone).trim() : "";
@@ -122,10 +159,17 @@ async function ensureAppSettingsSchema() {
       defaultValue: "America/Guayaquil",
     });
   }
+  if (!table.iconPath) {
+    await qi.addColumn("app_settings", "iconPath", {
+      type: DataTypes.STRING(255),
+      allowNull: true,
+      defaultValue: null,
+    });
+  }
   const boolCols = [
-    ["showPublicCatalog", true],
-    ["showPublicStoresPropia", true],
-    ["showPublicStoresVitrina", true],
+    ["showPublicCatalog", false],
+    ["showPublicStoresPropia", false],
+    ["showPublicStoresVitrina", false],
   ];
   for (const [col, def] of boolCols) {
     if (!table[col]) {
@@ -160,9 +204,9 @@ export async function loadAppSettings() {
   cache = {
     ...DEFAULT_APP_SETTINGS,
     ...raw,
-    showPublicCatalog: asBool(raw.showPublicCatalog, true),
-    showPublicStoresPropia: asBool(raw.showPublicStoresPropia, true),
-    showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, true),
+    showPublicCatalog: asBool(raw.showPublicCatalog, false),
+    showPublicStoresPropia: asBool(raw.showPublicStoresPropia, false),
+    showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, false),
   };
   ensureStandardAssetDirs(cache.mediaFolderPrefix);
   return cache;
@@ -175,7 +219,7 @@ export async function updateAppSettings(payload) {
     "showPublicStoresPropia",
     "showPublicStoresVitrina",
   ]) {
-    if (key in patch) patch[key] = asBool(patch[key], true);
+    if (key in patch) patch[key] = asBool(patch[key], false);
   }
   let row = await AppSettings.findByPk(1);
   if (!row) {
@@ -187,9 +231,9 @@ export async function updateAppSettings(payload) {
   cache = {
     ...DEFAULT_APP_SETTINGS,
     ...raw,
-    showPublicCatalog: asBool(raw.showPublicCatalog, true),
-    showPublicStoresPropia: asBool(raw.showPublicStoresPropia, true),
-    showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, true),
+    showPublicCatalog: asBool(raw.showPublicCatalog, false),
+    showPublicStoresPropia: asBool(raw.showPublicStoresPropia, false),
+    showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, false),
   };
   return cache;
 }
@@ -202,6 +246,7 @@ export function toPublicSettings(data = cache) {
     description: data.description,
     author: data.author,
     logoPath: data.logoPath,
+    iconPath: data.iconPath,
     phone: data.phone,
     socials: {
       whatsapp: data.socialWhatsapp || "",
@@ -212,12 +257,13 @@ export function toPublicSettings(data = cache) {
     },
     mediaFolderPrefix: data.mediaFolderPrefix,
     logoFolder: logosFolder(),
+    iconFolder: iconsFolder(),
     qrFolder: qrFolder(),
     cajaQuickCategoryMatch: data.cajaQuickCategoryMatch || "",
     walkInCustomerLabel: data.walkInCustomerLabel || "Consumidor Final",
     timezone: data.timezone || "America/Guayaquil",
-    showPublicCatalog: asBool(data.showPublicCatalog, true),
-    showPublicStoresPropia: asBool(data.showPublicStoresPropia, true),
-    showPublicStoresVitrina: asBool(data.showPublicStoresVitrina, true),
+    showPublicCatalog: asBool(data.showPublicCatalog, false),
+    showPublicStoresPropia: asBool(data.showPublicStoresPropia, false),
+    showPublicStoresVitrina: asBool(data.showPublicStoresVitrina, false),
   };
 }

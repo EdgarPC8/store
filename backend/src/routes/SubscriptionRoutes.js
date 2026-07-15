@@ -12,7 +12,7 @@ import {
 
 const router = Router();
 
-/** Frontend Store: suscripción local. */
+/** Frontend EdDeli: suscripción local. */
 router.get("/subscription", getSubscription);
 
 /** Gestor → habilita / actualiza entitlement en esta app. */

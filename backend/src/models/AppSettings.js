@@ -16,6 +16,8 @@ export const AppSettings = sequelize.define(
     description: { type: DataTypes.TEXT, allowNull: true },
     author: { type: DataTypes.STRING(120), allowNull: true },
     logoPath: { type: DataTypes.STRING(255), allowNull: true },
+    /** Icono / favicon (emblema), distinto del logo de marca. */
+    iconPath: { type: DataTypes.STRING(255), allowNull: true },
     phone: { type: DataTypes.STRING(40), allowNull: true },
     socialWhatsapp: { type: DataTypes.STRING(255), allowNull: true },
     socialFacebook: { type: DataTypes.STRING(255), allowNull: true },
@@ -41,19 +43,19 @@ export const AppSettings = sequelize.define(
     showPublicCatalog: {
       type: DataTypes.BOOLEAN,
       allowNull: false,
-      defaultValue: true,
+      defaultValue: false,
     },
     /** Vista pública: mostrar sucursales propias (puntos de venta). */
     showPublicStoresPropia: {
       type: DataTypes.BOOLEAN,
       allowNull: false,
-      defaultValue: true,
+      defaultValue: false,
     },
     /** Vista pública: mostrar vitrinas (locales de entrega). */
     showPublicStoresVitrina: {
       type: DataTypes.BOOLEAN,
       allowNull: false,
-      defaultValue: true,
+      defaultValue: false,
     },
   },
   { timestamps: true },
