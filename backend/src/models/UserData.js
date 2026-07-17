@@ -51,5 +51,5 @@ export const UserData = sequelize.define(
   { timestamps: false }
 );
 
-Users.hasOne(UserData, { foreignKey: "idUser", onDelete: "CASCADE" });
-UserData.belongsTo(Users, { foreignKey: "idUser" });
+Users.hasOne(UserData, { foreignKey: "idUser", onDelete: "CASCADE", as: "userData" });
+UserData.belongsTo(Users, { foreignKey: "idUser", as: "userData" });
