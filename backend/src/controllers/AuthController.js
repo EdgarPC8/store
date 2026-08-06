@@ -1,6 +1,6 @@
 import { Users } from "../models/Users.js";
 import { Account } from "../models/Account.js";
-import bcrypt from "bcrypt";
+import bcrypt from "bcryptjs";
 import { createAccessToken, createLicenseToken, getHeaderToken, verifyJWT } from "../libs/jwt.js";
 import { Roles } from "../models/Roles.js";
 import { logger } from "../log/LogActivity.js";

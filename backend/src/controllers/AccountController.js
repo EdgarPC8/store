@@ -2,7 +2,7 @@ import { sequelize } from "../database/connection.js";
 import { Account, AccountRoles } from "../models/Account.js";
 import { Roles } from "../models/Roles.js";
 import { Users } from "../models/Users.js";
-import bcrypt from "bcrypt";
+import bcrypt from "bcryptjs";
 import { notifyOk, notifyFail } from "../services/notifyRaptorSolutions.js";
 
 /** Quita el rol Programador de un listado de IDs si quien pide no es Programador. */
