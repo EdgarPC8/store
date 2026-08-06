@@ -3,6 +3,8 @@ import {
   saveEntitlement,
   pullEntitlementFromGestor,
 } from "../services/entitlementService.js";
+import { notifyOk, notifyFail } from "../services/notifyRaptorSolutions.js";
+import { broadcastEntitlementUpdated } from "../sockets/notificationSocket.js";
 
 /** GET — lo que usa el frontend Store (sin llamar al gestor). */
 export async function getSubscription(req, res, next) {
@@ -22,8 +24,15 @@ export async function getSubscription(req, res, next) {
 export async function putEntitlementFromGestor(req, res, next) {
   try {
     const data = await saveEntitlement(req.body, "gestor_push");
+    broadcastEntitlementUpdated(data);
+    notifyOk("subscription.entitlement_updated", "Entitlement actualizado", data);
     res.json({ ok: true, ...data });
   } catch (err) {
+    notifyFail("subscription.entitlement_update_failed", "Error al actualizar entitlement", {
+      error: err,
+      req,
+      httpStatus: err.status || 500,
+    });
     next(err);
   }
 }
@@ -32,6 +41,8 @@ export async function putEntitlementFromGestor(req, res, next) {
 export async function pullSubscription(req, res, next) {
   try {
     const data = await pullEntitlementFromGestor();
+    broadcastEntitlementUpdated(data);
+    notifyOk("subscription.pulled", "Suscripción sincronizada", data);
     res.json({ ok: true, ...data });
   } catch (err) {
     const status = err.response?.status || err.status || 500;
@@ -39,6 +50,11 @@ export async function pullSubscription(req, res, next) {
       err.response?.data?.error ||
       err.message ||
       "Error al sincronizar con el gestor";
+    notifyFail("subscription.pull_failed", message, {
+      error: err,
+      req,
+      httpStatus: status,
+    });
     res.status(status).json({ error: message });
   }
 }

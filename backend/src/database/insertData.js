@@ -17,14 +17,17 @@ import {
   InventoryMovement,
   InventoryProduct,
   InventoryUnit,
+  InventoryBatch,
   HomeProduct,
   Store,
   Catalog,
+  StoreExhibidor,
   StoreProduct,
   ProductCompareGroup,
   ProductCompareGroupItem,
   PricingTierGroup,
 } from "../models/Inventory.js";
+import { StoreStock } from "../models/StoreStock.js";
 import {
   Customer,
   Order,
@@ -42,6 +45,8 @@ import {
   FinancialObligation,
   ObligationPayment,
   SupplierOrderPayment,
+  SupplierPack,
+  SupplierPackItem,
   RecurringExpenseTemplate,
   RecurringExpenseOccurrence,
 } from "../models/Finance.js";
@@ -56,6 +61,7 @@ import {
 } from "../models/Editor.js";
 import { CashShift } from "../models/CashShift.js";
 import { CashShiftMovement } from "../models/CashShiftMovement.js";
+import { CashRegister } from "../models/CashRegister.js";
 import { TaskPlan, TaskItem } from "../models/Tasks.js";
 import {
   PublicidadCampaign,
@@ -72,6 +78,7 @@ import { License } from "../models/License.js";
 import { Logs } from "../models/Logs.js";
 import { UserData } from "../models/UserData.js";
 import { AppSettings } from "../models/AppSettings.js";
+import { AppEntitlement } from "../models/AppEntitlement.js";
 import { SriBillingSettings, ElectronicInvoice } from "../models/SriBilling.js";
 
 export const backupFilePath = resolve(__dirname, "backup.json");
@@ -79,8 +86,8 @@ export const backups = resolve(__dirname, "..", "backups");
 
 /**
  * Tablas EdDeli incluidas en backup.json (guardar / recargar BD).
- * Excluidas a propósito (módulos SoftEd compartidos): quiz_*, form_*, alumni_*, cv_*.
- * Incluye comprobantes, gastos recurrentes, programas de notificación y medios.
+ * Solo EdDeli: no incluye módulos SoftEd ajenos (quiz/form/alumni/cv) aunque
+ * compartan la misma BD MySQL.
  */
 export const BACKUP_TABLE_ENTRIES = [
   { key: "Roles", model: Roles },
@@ -96,6 +103,11 @@ export const BACKUP_TABLE_ENTRIES = [
   { key: "InventoryProduct", model: InventoryProduct, sanitize: "InventoryProduct" },
   { key: "InventoryRecipe", model: InventoryRecipe },
   { key: "InventoryMovement", model: InventoryMovement },
+  { key: "InventoryBatch", model: InventoryBatch },
+  { key: "Store", model: Store },
+  { key: "CashRegister", model: CashRegister },
+  // StoreExhibidor tras Store y antes de StoreStock / StoreProduct (FK exhibidorId)
+  { key: "StoreExhibidor", model: StoreExhibidor },
   { key: "CashShift", model: CashShift, sanitize: "CashShift" },
   { key: "CashShiftMovement", model: CashShiftMovement },
   { key: "Customer", model: Customer },
@@ -112,7 +124,7 @@ export const BACKUP_TABLE_ENTRIES = [
   { key: "MediaAsset", model: MediaAsset, sanitize: "MediaAsset" },
   { key: "Expense", model: Expense },
   { key: "Income", model: Income },
-  { key: "Store", model: Store },
+  { key: "StoreStock", model: StoreStock },
   { key: "RecurringExpenseTemplate", model: RecurringExpenseTemplate },
   { key: "RecurringExpenseOccurrence", model: RecurringExpenseOccurrence },
   { key: "HomeProduct", model: HomeProduct },
@@ -125,6 +137,8 @@ export const BACKUP_TABLE_ENTRIES = [
   { key: "ItemGroupItem", model: ItemGroupItem },
   { key: "Payment", model: Payment },
   { key: "SupplierOrderPayment", model: SupplierOrderPayment },
+  { key: "SupplierPack", model: SupplierPack },
+  { key: "SupplierPackItem", model: SupplierPackItem },
   { key: "DocumentAttachment", model: DocumentAttachment },
   { key: "FinancialObligation", model: FinancialObligation },
   { key: "ObligationPayment", model: ObligationPayment },
@@ -138,6 +152,7 @@ export const BACKUP_TABLE_ENTRIES = [
   { key: "License", model: License },
   { key: "Logs", model: Logs },
   { key: "AppSettings", model: AppSettings },
+  { key: "AppEntitlement", model: AppEntitlement },
   { key: "SriBillingSettings", model: SriBillingSettings },
   { key: "ElectronicInvoice", model: ElectronicInvoice },
 ];
@@ -451,6 +466,10 @@ export function prepareBackupForRestore(jsonData) {
       if (next.showPublicStoresVitrina === undefined || next.showPublicStoresVitrina === null) {
         next.showPublicStoresVitrina = true;
       }
+      // Multistock: si el backup no trae el flag, Store arranca en un solo local.
+      if (next.multiStockEnabled === undefined || next.multiStockEnabled === null) {
+        next.multiStockEnabled = false;
+      }
       return next;
     });
   }
@@ -469,6 +488,28 @@ export function prepareBackupForRestore(jsonData) {
         next.emissionPointCode = "001";
       }
       return next;
+    });
+  }
+
+  // Backups viejos sin StoreExhibidor: anula exhibidorId huérfanos.
+  const exhibidores = Array.isArray(data.StoreExhibidor) ? data.StoreExhibidor : [];
+  const validExhibidorIds = new Set(exhibidores.map((e) => e?.id).filter((id) => id != null));
+  if (Array.isArray(data.StoreProduct)) {
+    data.StoreProduct = data.StoreProduct.map((row) => {
+      if (!row || row.exhibidorId == null) return row;
+      if (!validExhibidorIds.has(row.exhibidorId)) {
+        return { ...row, exhibidorId: null };
+      }
+      return row;
+    });
+  }
+  if (Array.isArray(data.StoreStock)) {
+    data.StoreStock = data.StoreStock.map((row) => {
+      if (!row || row.exhibidorId == null) return row;
+      if (!validExhibidorIds.has(row.exhibidorId)) {
+        return { ...row, exhibidorId: null };
+      }
+      return row;
     });
   }
 

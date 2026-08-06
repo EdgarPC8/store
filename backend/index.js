@@ -36,9 +36,11 @@ import SriBillingRoutes from "./src/routes/SriBillingRoutes.js";
 import { loadAppSettings } from "./src/services/appSettingsService.js";
 import { loadSriBillingSettings } from "./src/services/sriBillingService.js";
 import { ensureEntitlementTable } from "./src/services/entitlementService.js";
-import { ensureCustomerNameSchema } from "./src/services/customerNameService.js";
-import { Store } from "./src/models/Inventory.js";
-import { CashShift } from "./src/models/CashShift.js";
+import { seedDefaultCashRegistersForOwnStores } from "./src/models/CashRegister.js";
+import {
+  ensureBodegaStore,
+  migrateGlobalStockToBodega,
+} from "./src/services/storeStockService.js";
 
 import NotificationProgramRoutes from "./src/routes/NotificationProgramRoutes.js";
 import { startNotificationScheduler } from "./src/services/notificationScheduler.js";
@@ -128,11 +130,11 @@ export async function main() {
     await sequelize.authenticate();
     await loadAppSettings();
     await loadSriBillingSettings();
-    await ensureEntitlementTable();
-    // Columnas nuevas de locales (001/002) y turno ligado al local
-    await Store.sync({ alter: true });
-    await CashShift.sync({ alter: true });
-    await ensureCustomerNameSchema();
+    // Sin sync({ alter }) en arranque: el esquema se alinea a mano con `npm run db:sync`.
+    await ensureEntitlementTable({ alter: false });
+    await seedDefaultCashRegistersForOwnStores();
+    await ensureBodegaStore();
+    await migrateGlobalStockToBodega();
 
     // ═══════════════════════════════════════════════════════════════════
     // ⚠️  SOLO DESARROLLO — Reset total (borra tablas y carga backup.json)

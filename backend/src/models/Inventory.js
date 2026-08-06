@@ -290,14 +290,17 @@ export const Store = sequelize.define(
 
     // Meta UI / ordenamiento y visibilidad
     position: { type: DataTypes.INTEGER, defaultValue: 0 },        // orden en lista
-    isActive: { type: DataTypes.BOOLEAN, defaultValue: true },     // visible en home/lista
+    isActive: { type: DataTypes.BOOLEAN, defaultValue: true },     // operativo (turno, stock, movimientos)
+    /** Vitrina pública (home / punto de venta). Si isActive=false → forzar false. */
+    isVisible: { type: DataTypes.BOOLEAN, defaultValue: true },
 
     /**
-     * propia = tu panadería / caja (turno + códigos SRI 001/002)
-     * vitrina = local ajeno donde entregas producto para que vendan
+     * propia = sucursal con turno/caja
+     * vitrina = local ajeno (sin stock inventariable)
+     * bodega = almacén (stock, sin turno/caja)
      */
     locationKind: {
-      type: DataTypes.ENUM("propia", "vitrina"),
+      type: DataTypes.ENUM("propia", "vitrina", "bodega"),
       allowNull: false,
       defaultValue: "vitrina",
     },
@@ -324,6 +327,7 @@ export const Store = sequelize.define(
     timestamps: true, // createdAt, updatedAt
     indexes: [
       { fields: ["isActive"] },
+      { fields: ["isVisible"] },
       { fields: ["position"] },
       { fields: ["city"] },
       { fields: ["province"] },
@@ -355,13 +359,49 @@ export const StoreProduct = sequelize.define("ERP_store_products", {
   },
 
   isActive: { type: DataTypes.BOOLEAN, defaultValue: true },
+
+  /** Organización visual dentro del local (no afecta stock). */
+  exhibidorId: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    comment: "Exhibidor del local; null = sin asignar. El stock sigue siendo por local.",
+  },
 }, {
   timestamps: true,
   indexes: [
     { unique: true, fields: ["storeId", "productId"] },
     { fields: ["isActive"] },
+    { fields: ["exhibidorId"] },
   ],
 });
+
+/**
+ * Exhibidor = zona/estante del local solo para organizar productos.
+ * No lleva cantidad de stock (el stock es StoreStock por local).
+ */
+export const StoreExhibidor = sequelize.define(
+  "ERP_store_exhibidores",
+  {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    storeId: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      references: { model: "ERP_stores", key: "id" },
+      onDelete: "CASCADE",
+      onUpdate: "CASCADE",
+    },
+    name: { type: DataTypes.STRING(120), allowNull: false },
+    position: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    isActive: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+  },
+  {
+    timestamps: true,
+    indexes: [
+      { fields: ["storeId", "position"] },
+      { fields: ["storeId", "isActive"] },
+    ],
+  },
+);
 
 
 Store.belongsToMany(InventoryProduct, {
@@ -379,6 +419,12 @@ InventoryProduct.belongsToMany(Store, {
 // StoreProduct ↔ InventoryProduct
 StoreProduct.belongsTo(InventoryProduct, { foreignKey: 'productId' });
 InventoryProduct.hasMany(StoreProduct, { foreignKey: 'productId' });
+
+Store.hasMany(StoreExhibidor, { foreignKey: "storeId", as: "exhibidores", onDelete: "CASCADE" });
+StoreExhibidor.belongsTo(Store, { foreignKey: "storeId", as: "store" });
+
+StoreExhibidor.hasMany(StoreProduct, { foreignKey: "exhibidorId", as: "storeProducts" });
+StoreProduct.belongsTo(StoreExhibidor, { foreignKey: "exhibidorId", as: "exhibidor" });
 
 // InventoryProduct ↔ Category / Unit
 InventoryProduct.belongsTo(InventoryCategory, { foreignKey: 'categoryId' });
@@ -440,6 +486,57 @@ InventoryProduct.hasMany(InventoryMovement, { foreignKey: 'productId', onDelete:
 InventoryMovement.belongsTo(InventoryProduct, { foreignKey: 'productId' });
 InventoryUnit.hasMany(InventoryProduct, { foreignKey: 'unitId' });
 InventoryProduct.belongsTo(InventoryUnit, { foreignKey: 'unitId' });
+
+/** Lotes de inventario con fecha de vencimiento (stock por lote + historial). */
+export const InventoryBatch = sequelize.define(
+  "ERP_inventory_batches",
+  {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    productId: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      references: { model: "ERP_inventory_products", key: "id" },
+      onUpdate: "CASCADE",
+      onDelete: "CASCADE",
+    },
+    code: { type: DataTypes.STRING(80), allowNull: true },
+    quantityInitial: { type: DataTypes.FLOAT, allowNull: false, defaultValue: 0 },
+    quantityRemaining: { type: DataTypes.FLOAT, allowNull: false, defaultValue: 0 },
+    /** Fecha de vencimiento / caducidad (obligatoria). */
+    expiresAt: { type: DataTypes.DATEONLY, allowNull: false },
+    /** Fecha de elaboración (opcional; sirve para calcular vida útil). */
+    manufacturedAt: { type: DataTypes.DATEONLY, allowNull: true },
+    /** Cuándo se recibió / registró el lote. */
+    receivedAt: { type: DataTypes.DATE, allowNull: false },
+    notes: { type: DataTypes.TEXT, allowNull: true },
+    status: {
+      type: DataTypes.ENUM("active", "depleted"),
+      allowNull: false,
+      defaultValue: "active",
+    },
+    createdBy: { type: DataTypes.INTEGER, allowNull: true },
+  },
+  {
+    timestamps: true,
+    indexes: [
+      { fields: ["productId"] },
+      { fields: ["expiresAt"] },
+      { fields: ["status"] },
+      { fields: ["productId", "expiresAt"] },
+    ],
+  },
+);
+
+InventoryProduct.hasMany(InventoryBatch, {
+  foreignKey: "productId",
+  as: "batches",
+  onDelete: "CASCADE",
+});
+InventoryBatch.belongsTo(InventoryProduct, {
+  foreignKey: "productId",
+  as: "product",
+});
+InventoryBatch.belongsTo(Account, { foreignKey: "createdBy", as: "creator" });
 
 // Insumo genérico ↔ presentaciones / marcas
 InventoryProduct.belongsTo(InventoryProduct, {

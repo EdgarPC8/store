@@ -43,4 +43,31 @@ if [[ -f "$DST/src/controllers/SubscriptionController.js" ]]; then
     "$DST/src/controllers/SubscriptionController.js" 2>/dev/null || true
 fi
 
-echo "✅ Sync eddeli → store (sin tocar identidad Store / AppSettings Raptor / seed)."
+# Store: un solo local — al restaurar backups, forzar multiStock desactivado.
+INSERT_DATA="$DST/src/database/insertData.js"
+if [[ -f "$INSERT_DATA" ]]; then
+  python3 - "$INSERT_DATA" <<'PY'
+import re, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+text = p.read_text(encoding="utf-8")
+old = """      if (next.multiStockEnabled === undefined || next.multiStockEnabled === null) {
+        next.multiStockEnabled = true;
+      }"""
+new = """      // Store: un solo local (aunque el backup venga de Eddeli con multistock).
+      next.multiStockEnabled = false;"""
+if old in text:
+    p.write_text(text.replace(old, new), encoding="utf-8")
+elif "next.multiStockEnabled = false;" not in text:
+    # Fallback: cualquier asignación true → false en AppSettings normalize
+    text2 = re.sub(
+        r"next\.multiStockEnabled\s*=\s*true;",
+        "next.multiStockEnabled = false;",
+        text,
+    )
+    if text2 != text:
+        p.write_text(text2, encoding="utf-8")
+PY
+fi
+
+echo "✅ Sync eddeli → store (sin tocar identidad Store / AppSettings Raptor / seed / multiStock OFF)."

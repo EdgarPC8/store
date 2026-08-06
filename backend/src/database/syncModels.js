@@ -6,12 +6,14 @@ import { License } from "../models/License.js";
 import { Logs } from "../models/Logs.js";
 import { CashShift } from "../models/CashShift.js";
 import { CashShiftMovement } from "../models/CashShiftMovement.js";
-import { InventoryProduct, InventoryMovement, InventoryCategory, InventoryUnit, InventoryRecipe, HomeProduct, Catalog, Store, StoreProduct, ProductCompareGroup, ProductCompareGroupItem, PricingTierGroup } from "../models/Inventory.js";
+import { InventoryProduct, InventoryMovement, InventoryCategory, InventoryUnit, InventoryRecipe, HomeProduct, Catalog, Store, StoreExhibidor, StoreProduct, ProductCompareGroup, ProductCompareGroupItem, PricingTierGroup, InventoryBatch } from "../models/Inventory.js";
+import { StoreStock } from "../models/StoreStock.js";
+import { CashRegister } from "../models/CashRegister.js";
 import { Customer, Order, OrderItem, Supplier, SupplierOrder, SupplierOrderItem } from "../models/Orders.js";
 import { TaskPlan, TaskItem } from "../models/Tasks.js";
 import { PublicidadCampaign, PublicidadPlaylistItem, PublicidadDevice } from "../models/Publicidad.js";
 import { MediaAsset } from "../models/MediaAsset.js";
-import { ItemGroup, ItemGroupItem, FinancialObligation, ObligationPayment, Income, Expense, Payment, SupplierOrderPayment, RecurringExpenseTemplate, RecurringExpenseOccurrence } from "../models/Finance.js";
+import { ItemGroup, ItemGroupItem, FinancialObligation, ObligationPayment, Income, Expense, Payment, SupplierOrderPayment, SupplierPack, SupplierPackItem, RecurringExpenseTemplate, RecurringExpenseOccurrence } from "../models/Finance.js";
 import { DocumentAttachment } from "../models/DocumentAttachment.js";
 import { NotificationProgram, NotificationDispatchLog } from "../models/NotificationProgram.js";
 import { Notifications } from "../models/Notifications.js";
@@ -44,6 +46,7 @@ const MODELS_TO_SYNC = [
   Account,
   UserData,
   Store,
+  CashRegister,
   InventoryProduct,
   CashShift,
   Order,
@@ -55,8 +58,11 @@ const MODELS_TO_SYNC = [
 
   // ── FK a tablas del grupo anterior ──
   InventoryMovement,
+  InventoryBatch,
   InventoryRecipe,
   HomeProduct,
+  StoreExhibidor,
+  StoreStock,
   StoreProduct,
   Catalog,
   ProductCompareGroupItem,
@@ -84,6 +90,8 @@ const MODELS_TO_SYNC = [
   RecurringExpenseTemplate,
   Payment,
   ItemGroupItem,
+  SupplierPack,
+  SupplierPackItem,
   SupplierOrderPayment,
   ObligationPayment,
   RecurringExpenseOccurrence,

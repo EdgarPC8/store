@@ -12,7 +12,7 @@ import {
   parseISO,
   isValid as isValidDate,
 } from "date-fns";
-import { toFinanceDayKey, buildFinanceDateColumnWhere } from "../../utils/financeDateUtils.js";
+import { toFinanceDayKey, buildPaddedFinanceDateColumnWhere, filterByFinanceDayKeyRange } from "../../utils/financeDateUtils.js";
 import { formatAppDateTime } from "../../utils/appDateTime.js";
 
 const CAJA_POS_TAG = "[CAJA_POS]";
@@ -232,25 +232,36 @@ function sumYearTotals(monthsMap) {
   return totals;
 }
 
-async function fetchOrdersInRange(start, end) {
+async function fetchOrdersInRange(start, end, { light = false } = {}) {
   return Order.findAll({
     where: { date: { [Op.between]: [start, end] } },
+    attributes: light ? ["id", "date", "notes", "customerId"] : undefined,
     include: [
-      { model: Customer, as: "ERP_customer", attributes: ["id", "name"] },
-      { model: OrderItem, as: "ERP_order_items" },
+      ...(light
+        ? []
+        : [{ model: Customer, as: "ERP_customer", attributes: ["id", "name"] }]),
+      {
+        model: OrderItem,
+        as: "ERP_order_items",
+        attributes: light
+          ? ["id", "quantity", "price", "deliveredAt", "soldQty"]
+          : undefined,
+      },
     ],
     order: [["date", "ASC"]],
   });
 }
 
 function financeRangeWhere(start, end) {
-  const clause = buildFinanceDateColumnWhere(start, end);
-  return clause ? { [Op.and]: [clause] } : {};
+  const padded = buildPaddedFinanceDateColumnWhere(start, end, 1);
+  return padded;
 }
 
 async function fetchIncomesInRange(start, end) {
-  return Income.findAll({
-    where: financeRangeWhere(start, end),
+  const padded = financeRangeWhere(start, end);
+  if (!padded?.where) return [];
+  const rows = await Income.findAll({
+    where: { [Op.and]: [padded.where] },
     attributes: [
       "id",
       "date",
@@ -263,11 +274,14 @@ async function fetchIncomesInRange(start, end) {
     ],
     order: [["date", "ASC"]],
   });
+  return filterByFinanceDayKeyRange(rows, padded.startKey, padded.endKey);
 }
 
 async function fetchExpensesInRange(start, end) {
-  return Expense.findAll({
-    where: financeRangeWhere(start, end),
+  const padded = financeRangeWhere(start, end);
+  if (!padded?.where) return [];
+  const rows = await Expense.findAll({
+    where: { [Op.and]: [padded.where] },
     attributes: [
       "id",
       "date",
@@ -279,6 +293,7 @@ async function fetchExpensesInRange(start, end) {
     ],
     order: [["date", "ASC"]],
   });
+  return filterByFinanceDayKeyRange(rows, padded.startKey, padded.endKey);
 }
 
 /**
@@ -413,7 +428,7 @@ export const getCalendarYearSummary = async (req, res) => {
     const end = endOfDay(endOfMonth(new Date(year, 11, 1)));
 
     const [orders, expenses] = await Promise.all([
-      fetchOrdersInRange(start, end),
+      fetchOrdersInRange(start, end, { light: true }),
       fetchExpensesInRange(start, end),
     ]);
 
@@ -454,7 +469,7 @@ export const getCalendarMonthSummary = async (req, res) => {
     }
 
     const [orders, expenses] = await Promise.all([
-      fetchOrdersInRange(range.start, range.end),
+      fetchOrdersInRange(range.start, range.end, { light: true }),
       fetchExpensesInRange(range.start, range.end),
     ]);
 

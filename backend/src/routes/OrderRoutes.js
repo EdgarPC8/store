@@ -45,10 +45,18 @@ import {
   markSupplierOrderPaid,
 } from "../controllers/InventoryControl/SupplierOrderController.js";
 import {
+  exportOrdersMonth,
+  importOrdersMonth,
+} from "../controllers/InventoryControl/OrderMonthTransferController.js";
+import {
   getSupplierPayablesWorkbench,
   paySupplierOrder,
   updateSupplierOrderPayment,
   deleteSupplierOrderPayment,
+  createSupplierPack,
+  paySupplierPack,
+  updateSupplierPack,
+  dissolveSupplierPack,
 } from "../controllers/InventoryControl/SupplierPayablesController.js";
 
 import { isAuthenticated, requireProgrammer } from "../middlewares/authMiddelware.js";
@@ -177,9 +185,19 @@ router.put("/supplier-orders/:id/paid", isAuthenticated, markSupplierOrderPaid);
 
 // Cuentas por pagar (abonos a pedidos de proveedor)
 router.get("/supplier-payables/workbench", isAuthenticated, getSupplierPayablesWorkbench);
+router.post("/supplier-payables/packs", isAuthenticated, createSupplierPack);
+router.put("/supplier-payables/packs/:packId", isAuthenticated, updateSupplierPack);
+router.post("/supplier-payables/packs/:packId/dissolve", isAuthenticated, dissolveSupplierPack);
+router.post("/supplier-payables/packs/:packId/pay", isAuthenticated, paySupplierPack);
 router.post("/supplier-payables/orders/:orderId/pay", isAuthenticated, paySupplierOrder);
 router.put("/supplier-payables/payments/:paymentId", isAuthenticated, updateSupplierOrderPayment);
 router.delete("/supplier-payables/payments/:paymentId", isAuthenticated, deleteSupplierOrderPayment);
+
+// =====================================================
+// ✅ TRANSFERENCIA MES (export/import JSON clientes + proveedores)
+// =====================================================
+router.get("/month-transfer/export", isAuthenticated, exportOrdersMonth);
+router.post("/month-transfer/import", isAuthenticated, importOrdersMonth);
 
 // =====================================================
 // ✅ ÓRDENES (LO TUYO NORMAL)

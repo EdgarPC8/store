@@ -9,6 +9,7 @@ import {
   updateProduct,
   deleteProduct,
   patchProductStock,
+  getProductStoreStocks,
 } from '../controllers/InventoryControl/ProductController.js';
 
 import {
@@ -45,6 +46,15 @@ import {
   updateUnit,
   deleteUnit,
 } from '../controllers/InventoryControl/UnitController.js';
+
+import {
+  getBatches,
+  getBatchesSummary,
+  createBatch,
+  updateBatch,
+  writeOffBatch,
+  deleteBatch,
+} from '../controllers/InventoryControl/BatchController.js';
 
 
 import {
@@ -90,6 +100,17 @@ import {
   updateStore,
   deleteStore,
 } from "../controllers/InventoryControl/StoresController.js";
+import {
+  listCashRegisters,
+  createCashRegister,
+  updateCashRegister,
+  deactivateCashRegister,
+} from "../controllers/InventoryControl/CashRegisterController.js";
+import {
+  transferStock,
+  getStocksByStore,
+  getBodegaInfo,
+} from "../controllers/InventoryControl/StoreStockController.js";
 // CatalogController: CRUD admin + template-items (diseño promocional)
 import {
   getCatalogEntries,
@@ -133,6 +154,13 @@ import {
 } 
 from '../controllers/InventoryControl/StoreProductsController.js';
 
+import {
+  listStoreExhibidores,
+  createStoreExhibidor,
+  updateStoreExhibidor,
+  deleteStoreExhibidor,
+} from "../controllers/InventoryControl/StoreExhibidorController.js";
+
 const router = express.Router();
 
 
@@ -141,6 +169,12 @@ router.get("/stores/:storeId/products", getProductsByStore);
 router.post("/stores/:storeId/products", isAuthenticated, addProductsToStore);
 router.delete("/stores/:storeId/products/:productId", isAuthenticated, removeProductFromStore);
 router.patch("/stores/:storeId/products/:productId", isAuthenticated, toggleStoreProduct);
+
+// Exhibidores del local (organización; no stock)
+router.get("/stores/:storeId/exhibidores", isAuthenticated, listStoreExhibidores);
+router.post("/stores/:storeId/exhibidores", isAuthenticated, createStoreExhibidor);
+router.put("/stores/:storeId/exhibidores/:exhibidorId", isAuthenticated, updateStoreExhibidor);
+router.delete("/stores/:storeId/exhibidores/:exhibidorId", isAuthenticated, deleteStoreExhibidor);
 
 // tiendas que tienen un producto (opcional)
 // router.get("/products/:productId/stores", getStoresByProduct);
@@ -188,6 +222,15 @@ router.post("/stores/", isAuthenticated, edDeliUploadSingle, createStore);
 router.put("/stores/:id", isAuthenticated, edDeliUploadSingle, updateStore);
 router.delete("/stores/:id", isAuthenticated, deleteStore);
 
+router.get("/stores/:storeId/registers", isAuthenticated, listCashRegisters);
+router.post("/stores/:storeId/registers", isAuthenticated, createCashRegister);
+router.put("/registers/:id", isAuthenticated, updateCashRegister);
+router.delete("/registers/:id", isAuthenticated, deactivateCashRegister);
+
+router.get("/bodega", isAuthenticated, getBodegaInfo);
+router.get("/stores/:storeId/stocks", isAuthenticated, getStocksByStore);
+router.post("/store-stocks/transfer", isAuthenticated, transferStock);
+
 // ----------------------------------
 // 🔁 Home Products
 // ----------------------------------
@@ -218,6 +261,7 @@ router.delete('/suppliers/:id', isAuthenticated, deleteSupplier);
 router.post('/products', isAuthenticated, edDeliUploadSingle, createProduct);            // Crear producto
 router.get('/products', isAuthenticated, getAllProducts);           // Obtener todos los productos
 router.patch('/products/:id/stock', isAuthenticated, requireProgrammer, patchProductStock);
+router.get('/products/:id/store-stocks', isAuthenticated, getProductStoreStocks);
 router.put('/products/:id', isAuthenticated, edDeliUploadSingle, updateProduct);        // Editar producto
 router.delete('/products/:id', isAuthenticated, deleteProduct);     // Eliminar producto
 
@@ -285,6 +329,16 @@ router.post('/units', isAuthenticated, createUnit);                 // Crear uni
 router.get('/units', isAuthenticated, getAllUnits);                 // Listar unidades
 router.put('/units/:id', isAuthenticated, updateUnit);              // Editar unidad
 router.delete('/units/:id', isAuthenticated, deleteUnit);           // Eliminar unidad
+
+// ----------------------------------
+// 📦 LOTES Y VENCIMIENTOS
+// ----------------------------------
+router.get('/batches/summary', isAuthenticated, getBatchesSummary);
+router.get('/batches', isAuthenticated, getBatches);
+router.post('/batches', isAuthenticated, createBatch);
+router.put('/batches/:id', isAuthenticated, updateBatch);
+router.post('/batches/:id/write-off', isAuthenticated, writeOffBatch);
+router.delete('/batches/:id', isAuthenticated, deleteBatch);
 
 
 

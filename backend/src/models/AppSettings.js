@@ -57,6 +57,11 @@ export const AppSettings = sequelize.define(
       allowNull: false,
       defaultValue: false,
     },
+    multiStockEnabled: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
   },
   { timestamps: true },
 );

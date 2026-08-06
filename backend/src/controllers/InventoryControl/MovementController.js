@@ -19,6 +19,13 @@ import {
 
 import { Op, fn, col, literal } from "sequelize";
 import { parsePagination, sendPaginated } from "../../utils/pagination.js";
+import { notifyOk, notifyFail } from "../../services/notifyRaptorSolutions.js";
+import {
+  adjustStoreStock,
+  getDefaultStockStoreId,
+  setStoreStockAbsolute,
+  getStoreStockQty,
+} from "../../services/storeStockService.js";
 
 // helpers
 const startOfDay = (d) => {
@@ -37,7 +44,7 @@ const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const createBatchReferenceId = () => Math.floor(Date.now() / 1000);
 
 const PROGRAMMER_ONLY_MSG =
-  "Solo el rol Programador puede editar, eliminar movimientos o usar fecha personalizada";
+  "No tenés permiso para editar o eliminar movimientos";
 
 const PRODUCTION_OP_REF_PREFIX = "produccion_op:";
 
@@ -258,6 +265,7 @@ export const registerProductionIntermediateFromPayload = async (req, res) => {
   try {
     user = await verifyJWT(token);
   } catch (e) {
+    notifyFail("production.intermediate_register_failed", "No autorizado", { req, httpStatus: 401 });
     return res.status(401).json({ message: "No autorizado" });
   }
 
@@ -268,6 +276,10 @@ export const registerProductionIntermediateFromPayload = async (req, res) => {
   const insumos = Array.isArray(payload.insumos) ? payload.insumos : [];
 
   if (!intermedio.id || intermedio.gramos === undefined || intermedio.gramos === null) {
+    notifyFail("production.intermediate_register_failed", "intermedio.id y gramos requeridos", {
+      req,
+      httpStatus: 400,
+    });
     return res.status(400).json({ message: "intermedio.id y intermedio.gramos son requeridos" });
   }
 
@@ -403,9 +415,15 @@ export const registerProductionIntermediateFromPayload = async (req, res) => {
       return resumen;
     });
 
+    notifyOk("production.intermediate_registered", "Producción intermedia", { opId: out.opId, resumen: out });
     return res.status(200).json({ ok: true, message: "Producción registrada", resumen: out });
   } catch (error) {
     console.error("registerProductionIntermediateFromPayload error:", error);
+    notifyFail("production.intermediate_register_failed", "Error al registrar producción", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     return res.status(500).json({
       ok: false,
       message: "Error al registrar producción",
@@ -421,19 +439,25 @@ export const registerProductionFinalFromPayload = async (req, res) => {
   try {
     user = await verifyJWT(token);
   } catch (e) {
+    notifyFail("production.final_register_failed", "No autorizado", { req, httpStatus: 401 });
     return res.status(401).json({ message: "No autorizado" });
   }
 
   if (!productId || !quantity) {
+    notifyFail("production.final_register_failed", "Faltan campos obligatorios", { req, httpStatus: 400 });
     return res.status(400).json({ message: "Faltan campos obligatorios" });
   }
 
   if (!simulated || !simulated.requiere) {
+    notifyFail("production.final_register_failed", "Falta estructura de simulación", { req, httpStatus: 400 });
     return res.status(400).json({ message: "Falta estructura de simulación" });
   }
 
   const finalProduct = await InventoryProduct.findByPk(productId);
-  if (!finalProduct) return res.status(404).json({ message: "Producto no encontrado" });
+  if (!finalProduct) {
+    notifyFail("production.final_register_failed", "Producto no encontrado", { req, httpStatus: 404 });
+    return res.status(404).json({ message: "Producto no encontrado" });
+  }
 
   const opId = `PF-${Date.now()}-${Math.floor(Math.random() * 1e5)}`;
   const prodMovementDate = resolveMovementDate(movementDate, user);
@@ -558,9 +582,15 @@ export const registerProductionFinalFromPayload = async (req, res) => {
       await finalProduct.save({ transaction: t });
     });
 
+    notifyOk("production.final_registered", "Producción final", { opId, productId });
     return res.status(201).json({ ok: true, message: "Producción registrada exitosamente" });
   } catch (error) {
     console.error("registerProductionFinalFromPayload error:", error);
+    notifyFail("production.final_register_failed", "Error al registrar producción", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     return res.status(500).json({
       ok: false,
       message: "Error al registrar producción",
@@ -582,39 +612,42 @@ const MOVEMENT_TYPES = ["entrada", "salida", "ajuste", "produccion"];
 const AJUSTE_REASONS_DB = new Set(["AJUSTE_ENTRADA", "AJUSTE_SALIDA"]);
 
 /**
- * ENTRADA: suma cantidad al stock (compras, devoluciones, otras entradas).
- * @param {import("sequelize").Model} product InventoryProduct
- * @param {number} qtyDelta cantidad a sumar (>= 0 esperado)
+ * ENTRADA: suma cantidad al stock del local (default bodega).
  */
-async function applyMovementEntrada(product, qtyDelta, transaction) {
-  product.stock = parseFloat(product.stock) + qtyDelta;
-  await product.save({ transaction });
+async function applyMovementEntrada(product, qtyDelta, transaction, storeId) {
+  const sid = storeId || (await getDefaultStockStoreId({ transaction }));
+  await adjustStoreStock(sid, product.id, qtyDelta, { transaction, allowNegative: false });
+  await product.reload({ transaction });
 }
 
 /**
- * PRODUCCIÓN: mismo efecto contable que entrada — incrementa stock del producto fabricado.
- * (El desglose de insumos va por otros flujos: registerProductionFinalFromPayload, etc.)
+ * PRODUCCIÓN: incrementa stock del producto fabricado en el local.
  */
-async function applyMovementProduccion(product, qtyDelta, transaction) {
-  product.stock = parseFloat(product.stock) + qtyDelta;
-  await product.save({ transaction });
+async function applyMovementProduccion(product, qtyDelta, transaction, storeId) {
+  const sid = storeId || (await getDefaultStockStoreId({ transaction }));
+  await adjustStoreStock(sid, product.id, qtyDelta, { transaction, allowNegative: false });
+  await product.reload({ transaction });
 }
 
 /**
- * SALIDA: resta cantidad del stock (venta, consumo interno, merma, etc.)
+ * SALIDA: resta del stock del local.
  */
-async function applyMovementSalida(product, qtyDelta, transaction) {
-  product.stock = parseFloat(product.stock) - qtyDelta;
-  await product.save({ transaction });
+async function applyMovementSalida(product, qtyDelta, transaction, storeId) {
+  const sid = storeId || (await getDefaultStockStoreId({ transaction }));
+  await adjustStoreStock(sid, product.id, -qtyDelta, { transaction, allowNegative: false });
+  await product.reload({ transaction });
 }
 
 /**
- * AJUSTE: `nuevoStockAbsoluto` reemplaza el stock (inventario físico / conteo).
- * No es un delta: el front envía el valor final deseado en `quantity`.
+ * AJUSTE: cantidad absoluta en el local (default bodega); el total del producto es la suma.
  */
-async function applyMovementAjuste(product, nuevoStockAbsoluto, transaction) {
-  product.stock = nuevoStockAbsoluto;
-  await product.save({ transaction });
+async function applyMovementAjuste(product, nuevoStockAbsoluto, transaction, storeId) {
+  const sid = storeId || (await getDefaultStockStoreId({ transaction }));
+  await setStoreStockAbsolute(sid, product.id, nuevoStockAbsoluto, {
+    transaction,
+    allowNegative: false,
+  });
+  await product.reload({ transaction });
 }
 
 /**
@@ -762,6 +795,7 @@ export const openPresentationMovement = async (req, res) => {
     } = req.body;
 
     if (movementDateInput != null && movementDateInput !== "" && !assertProgrammerRole(user)) {
+      notifyFail("movement.presentation_open_failed", PROGRAMMER_ONLY_MSG, { req, httpStatus: 403 });
       return res.status(403).json({ message: PROGRAMMER_ONLY_MSG });
     }
 
@@ -769,6 +803,7 @@ export const openPresentationMovement = async (req, res) => {
     const packs = Math.max(1, Math.floor(num(packsToOpen)) || 1);
 
     if (!presentationId) {
+      notifyFail("movement.presentation_open_failed", "Selecciona una presentación", { req, httpStatus: 400 });
       return res.status(400).json({ message: "Selecciona una presentación." });
     }
 
@@ -789,6 +824,11 @@ export const openPresentationMovement = async (req, res) => {
         err.statusCode = 400;
         throw err;
       }
+      if (presentation.isGenericIngredient) {
+        const err = new Error("Un insumo genérico no se abre como presentación.");
+        err.statusCode = 400;
+        throw err;
+      }
 
       const generic = await InventoryProduct.findByPk(presentation.genericProductId, {
         include: [{ model: InventoryUnit }],
@@ -796,7 +836,7 @@ export const openPresentationMovement = async (req, res) => {
         lock: t.LOCK.UPDATE,
       });
 
-      if (!generic?.isGenericIngredient) {
+      if (!generic?.isGenericIngredient || generic.type !== "raw") {
         const err = new Error("El insumo genérico asociado no es válido.");
         err.statusCode = 400;
         throw err;
@@ -891,12 +931,21 @@ export const openPresentationMovement = async (req, res) => {
       };
     });
 
+    notifyOk("movement.presentation_opened", "Presentación abierta", {
+      presentationProductId: presentationId,
+      packsOpened: result.packsOpened,
+    });
     return res.status(201).json({
       message: "Presentación abierta y stock transferido al insumo genérico.",
       ...result,
     });
   } catch (error) {
     const status = error?.statusCode || 500;
+    notifyFail("movement.presentation_open_failed", error?.message || "Error al abrir presentación", {
+      error,
+      req,
+      httpStatus: status,
+    });
     return res.status(status).json({
       message: error?.message || "Error al abrir presentación",
       error: String(error?.message || error),
@@ -920,6 +969,7 @@ async function applyMovementRecord(
     referenceType,
     referenceId,
     date: movementDateInput,
+    storeId: storeIdInput,
   },
   user,
   transaction,
@@ -960,17 +1010,24 @@ async function applyMovementRecord(
     throw err;
   }
 
-  const stockAntes = parseFloat(product.stock) || 0;
+  const stockStoreId =
+    storeIdInput != null && storeIdInput !== ""
+      ? Number(storeIdInput)
+      : await getDefaultStockStoreId({ transaction });
+
+  const stockAntes = stockStoreId
+    ? await getStoreStockQty(stockStoreId, productId, { transaction })
+    : parseFloat(product.stock) || 0;
   const reasonParaDb = normalizeMovementReason(type, reason, stockAntes, qty);
 
   if (type === "entrada") {
-    await applyMovementEntrada(product, qty, transaction);
+    await applyMovementEntrada(product, qty, transaction, stockStoreId);
   } else if (type === "produccion") {
-    await applyMovementProduccion(product, qty, transaction);
+    await applyMovementProduccion(product, qty, transaction, stockStoreId);
   } else if (type === "salida") {
-    await applyMovementSalida(product, qty, transaction);
+    await applyMovementSalida(product, qty, transaction, stockStoreId);
   } else if (type === "ajuste") {
-    await applyMovementAjuste(product, qty, transaction);
+    await applyMovementAjuste(product, qty, transaction, stockStoreId);
   }
 
   let expenseId = null;
@@ -1017,6 +1074,7 @@ export const registerMovement = async (req, res) => {
     const user = await verifyJWT(token);
 
     if (body.date != null && body.date !== "" && !assertProgrammerRole(user)) {
+      notifyFail("movement.create_failed", PROGRAMMER_ONLY_MSG, { req, httpStatus: 403 });
       return res.status(403).json({ message: PROGRAMMER_ONLY_MSG });
     }
 
@@ -1028,6 +1086,7 @@ export const registerMovement = async (req, res) => {
       expenseId = result.expenseId;
     });
 
+    notifyOk("movement.created", `Movimiento #${movementId}`, { movementId, expenseId });
     res.status(201).json({
       message: "Movimiento registrado exitosamente",
       movementId,
@@ -1040,6 +1099,7 @@ export const registerMovement = async (req, res) => {
       status === 500
         ? error?.message || "Error al registrar movimiento"
         : error?.message || "Error al registrar movimiento";
+    notifyFail("movement.create_failed", message, { error, req, httpStatus: status });
     res.status(status).json({ message, error: String(error?.message || error) });
   }
 };
@@ -1055,20 +1115,30 @@ export const registerMovementsBatch = async (req, res) => {
     const user = await verifyJWT(token);
 
     if (movementDateInput != null && movementDateInput !== "" && !assertProgrammerRole(user)) {
+      notifyFail("movement.batch_create_failed", PROGRAMMER_ONLY_MSG, { req, httpStatus: 403 });
       return res.status(403).json({ message: PROGRAMMER_ONLY_MSG });
     }
 
     if (!Array.isArray(items) || items.length === 0) {
+      notifyFail("movement.batch_create_failed", "Envía al menos un movimiento en items", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({ message: "Envía al menos un movimiento en items." });
     }
 
     if (items.length > 100) {
+      notifyFail("movement.batch_create_failed", "Máximo 100 movimientos por lote", { req, httpStatus: 400 });
       return res.status(400).json({ message: "Máximo 100 movimientos por lote." });
     }
 
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
       if (!BATCH_MOVEMENT_TYPES.has(it?.type)) {
+        notifyFail("movement.batch_create_failed", `Ítem ${i + 1}: tipo inválido en lote`, {
+          req,
+          httpStatus: 400,
+        });
         return res.status(400).json({
           message: `Ítem ${i + 1}: solo entrada, salida o ajuste en lote.`,
         });
@@ -1094,6 +1164,11 @@ export const registerMovementsBatch = async (req, res) => {
       return { movementIds, expenseIds };
     });
 
+    notifyOk("movement.batch_created", "Movimientos en lote", {
+      count: result.movementIds.length,
+      batchKey,
+      batchRef,
+    });
     return res.status(201).json({
       message: `${result.movementIds.length} movimiento(s) registrados.`,
       count: result.movementIds.length,
@@ -1104,6 +1179,11 @@ export const registerMovementsBatch = async (req, res) => {
     });
   } catch (error) {
     const status = error?.statusCode || 500;
+    notifyFail("movement.batch_create_failed", error?.message || "Error al registrar lote de movimientos", {
+      error,
+      req,
+      httpStatus: status,
+    });
     return res.status(status).json({
       message: error?.message || "Error al registrar lote de movimientos",
       error: String(error?.message || error),
@@ -1119,6 +1199,7 @@ export const updateMovement = async (req, res) => {
     const user = await verifyJWT(token);
 
     if (!assertProgrammerRole(user)) {
+      notifyFail("movement.update_failed", PROGRAMMER_ONLY_MSG, { req, httpStatus: 403 });
       return res.status(403).json({ message: PROGRAMMER_ONLY_MSG });
     }
 
@@ -1185,9 +1266,25 @@ export const updateMovement = async (req, res) => {
       };
     });
 
+    if (result.status >= 400) {
+      notifyFail("movement.update_failed", result.body?.message || "Error al actualizar movimiento", {
+        req,
+        httpStatus: result.status,
+        extra: { movementId },
+      });
+    } else {
+      notifyOk("movement.updated", `Movimiento #${movementId}`, { movementId });
+    }
+
     return res.status(result.status).json(result.body);
   } catch (error) {
     console.error("updateMovement:", error);
+    notifyFail("movement.update_failed", "Error al actualizar movimiento", {
+      error,
+      req,
+      httpStatus: 500,
+      extra: { movementId: req.params.movementId },
+    });
     return res.status(500).json({
       message: "Error al actualizar movimiento",
       error: String(error?.message || error),
@@ -1202,12 +1299,14 @@ export const updateMovementsDateBatch = async (req, res) => {
     const user = await verifyJWT(token);
 
     if (!assertProgrammerRole(user)) {
+      notifyFail("movement.date_batch_update_failed", PROGRAMMER_ONLY_MSG, { req, httpStatus: 403 });
       return res.status(403).json({ message: PROGRAMMER_ONLY_MSG });
     }
 
     const { movementIds, operationId, date: movementDateInput } = req.body;
 
     if (!movementDateInput) {
+      notifyFail("movement.date_batch_update_failed", "Falta date", { req, httpStatus: 400 });
       return res.status(400).json({ message: "Falta date" });
     }
 
@@ -1253,9 +1352,26 @@ export const updateMovementsDateBatch = async (req, res) => {
       };
     });
 
+    if (result.status >= 400) {
+      notifyFail("movement.date_batch_update_failed", result.body?.message || "Error al actualizar fechas", {
+        req,
+        httpStatus: result.status,
+      });
+    } else {
+      notifyOk("movement.date_batch_updated", "Fechas de movimientos actualizadas", {
+        updatedCount: result.body?.updatedCount,
+        operationId: result.body?.operationId,
+      });
+    }
+
     return res.status(result.status).json(result.body);
   } catch (error) {
     console.error("updateMovementsDateBatch:", error);
+    notifyFail("movement.date_batch_update_failed", "Error al actualizar fechas", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     return res.status(500).json({
       message: "Error al actualizar fechas",
       error: String(error?.message || error),
@@ -1271,6 +1387,7 @@ export const deleteMovement = async (req, res) => {
     const user = await verifyJWT(token);
 
     if (!assertProgrammerRole(user)) {
+      notifyFail("movement.delete_failed", PROGRAMMER_ONLY_MSG, { req, httpStatus: 403 });
       return res.status(403).json({ message: PROGRAMMER_ONLY_MSG });
     }
 
@@ -1288,9 +1405,25 @@ export const deleteMovement = async (req, res) => {
       };
     });
 
+    if (result.status >= 400) {
+      notifyFail("movement.delete_failed", result.body?.message || "Error al eliminar movimiento", {
+        req,
+        httpStatus: result.status,
+        extra: { movementId },
+      });
+    } else {
+      notifyOk("movement.deleted", `Movimiento #${movementId}`, { movementId: Number(movementId) });
+    }
+
     return res.status(result.status).json(result.body);
   } catch (error) {
     console.error("deleteMovement:", error);
+    notifyFail("movement.delete_failed", "Error al eliminar movimiento", {
+      error,
+      req,
+      httpStatus: 500,
+      extra: { movementId: req.params.movementId },
+    });
     return res.status(500).json({
       message: "Error al eliminar movimiento",
       error: String(error?.message || error),

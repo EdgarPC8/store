@@ -1,8 +1,8 @@
 import { verifyJWT, getHeaderToken } from "../../libs/jwt.js";
 
-import { InventoryMovement, InventoryProduct } from "../../models/Inventory.js";
+import { InventoryMovement, InventoryProduct, Store } from "../../models/Inventory.js";
 import { Customer, Order, OrderItem } from "../../models/Orders.js";
-import { Income } from "../../models/Finance.js";
+import { Income, ItemGroupItem, Payment } from "../../models/Finance.js";
 import { findOpenShiftForAccount } from "./ShiftController.js";
 import { format } from 'date-fns';
 import { de, es } from 'date-fns/locale';
@@ -11,36 +11,170 @@ import { Op } from "sequelize";
 import { sequelize } from "../../database/connection.js";
 import { logger } from "../../log/LogActivity.js";
 import { parsePagination, sendPaginated } from "../../utils/pagination.js";
-
-
-
+import { notifyOk, notifyFail } from "../../services/notifyRaptorSolutions.js";
+import {
+  adjustStoreStock,
+  getDefaultStockStoreId,
+  getStoreStockQty,
+  storeHoldsInventory,
+} from "../../services/storeStockService.js";
+import { getAppSettingsSync } from "../../services/appSettingsService.js";
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
-const CAJA_POS_TAG = "[CAJA_POS]";
+let orderItemDeliverSchemaReady = false;
+let orderItemPackSchemaReady = false;
 
-/** Pedidos manuales/calendario: notes NULL o sin marca de caja POS. */
-const nonCajaPosNotesWhere = {
+async function ensureOrderItemDeliverSchema() {
+  if (orderItemDeliverSchemaReady) return;
+  try {
+    const [found] = await sequelize.query(
+      "SHOW COLUMNS FROM `ERP_order_items` LIKE 'deliveredStoreId'",
+    );
+    if (!Array.isArray(found) || found.length === 0) {
+      await sequelize.query(
+        "ALTER TABLE `ERP_order_items` ADD COLUMN `deliveredStoreId` INT NULL",
+      );
+    }
+  } catch (e) {
+    console.warn("ensureOrderItemDeliverSchema:", e?.message || e);
+  }
+  orderItemDeliverSchemaReady = true;
+}
+
+async function ensureOrderItemPackSchema() {
+  if (orderItemPackSchemaReady) return;
+  const cols = [
+    ["packKey", "VARCHAR(64) NULL"],
+    ["packName", "VARCHAR(120) NULL"],
+    ["lotCode", "VARCHAR(80) NULL"],
+    ["expiresAt", "DATE NULL"],
+    ["manufacturedAt", "DATE NULL"],
+  ];
+  for (const [name, ddl] of cols) {
+    try {
+      const [found] = await sequelize.query(
+        `SHOW COLUMNS FROM \`ERP_order_items\` LIKE '${name}'`,
+      );
+      if (!Array.isArray(found) || found.length === 0) {
+        await sequelize.query(
+          `ALTER TABLE \`ERP_order_items\` ADD COLUMN \`${name}\` ${ddl}`,
+        );
+      }
+    } catch (e) {
+      console.warn(`ensureOrderItemPackSchema ${name}:`, e?.message || e);
+    }
+  }
+  orderItemPackSchemaReady = true;
+}
+
+function parseDayOnly(raw) {
+  if (raw == null || raw === "") return null;
+  const s = String(raw).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+function itemPackLotFields(row = {}) {
+  const packKey =
+    row.packKey != null && String(row.packKey).trim()
+      ? String(row.packKey).trim().slice(0, 64)
+      : null;
+  const packName =
+    row.packName != null && String(row.packName).trim()
+      ? String(row.packName).trim().slice(0, 120)
+      : null;
+  const lotCode =
+    row.lotCode != null && String(row.lotCode).trim()
+      ? String(row.lotCode).trim().slice(0, 80)
+      : null;
+  const expiresAt = parseDayOnly(row.expiresAt);
+  const manufacturedAt = parseDayOnly(row.manufacturedAt);
+  if (manufacturedAt && expiresAt && manufacturedAt > expiresAt) {
+    throw new Error("La fecha de elaboración no puede ser posterior al vencimiento");
+  }
+  return { packKey, packName, lotCode, expiresAt, manufacturedAt };
+}
+
+function buildCustomerItemPayload(orderId, row) {
+  const productId = Number(row.productId);
+  const quantity = num(row.quantity);
+  const price = num(row.price ?? row.unitPrice);
+  if (!productId || quantity <= 0) throw new Error("Ítem inválido en el pedido");
+  if (!Number.isFinite(price) || price < 0) throw new Error("Precio inválido en el pedido");
+  return {
+    orderId,
+    productId,
+    quantity,
+    price,
+    ...itemPackLotFields(row),
+  };
+}
+
+/** null = stock general; número = local inventariable. */
+async function resolveDeliverStoreId(body, { transaction, requireExplicit = false } = {}) {
+  const multi = getAppSettingsSync()?.multiStockEnabled !== false;
+  if (!multi) return null;
+  let sid =
+    body?.storeId != null && body.storeId !== "" ? Number(body.storeId) : null;
+  if (!Number.isFinite(sid) || sid <= 0) {
+    if (requireExplicit) {
+      throw new Error("Con multistock debes indicar Bodega o sucursal de donde sale el stock.");
+    }
+    sid = await getDefaultStockStoreId({ transaction });
+  }
+  const store = await Store.findByPk(sid, { transaction });
+  if (!store || !storeHoldsInventory(store.locationKind)) {
+    throw new Error("El local de entrega debe ser Bodega o sucursal propia.");
+  }
+  return Number(store.id);
+}
+
+/** Total cobrable de una línea (cantidad − dañado − regalo) × precio. */
+function orderItemBillableTotal(item) {
+  const qty = num(item?.quantity);
+  const billable = Math.max(0, qty - num(item?.damagedQty) - num(item?.giftQty));
+  return Number((billable * num(item?.price)).toFixed(2));
+}
+
+const CAJA_POS_TAG = "[CAJA_POS]";
+const SALE_CREDITO_TAG = "[CREDITO]";
+
+/**
+ * Pedidos del calendario/listado:
+ * - pedidos manuales (sin [CAJA_POS])
+ * - ventas de caja a crédito ([CREDITO] o paymentMethod credito)
+ * Se excluyen ventas de caja al contado (efectivo/transferencia).
+ */
+const pedidosListNotesWhere = {
   [Op.or]: [
     { notes: null },
     { notes: { [Op.notLike]: `%${CAJA_POS_TAG}%` } },
+    { notes: { [Op.like]: `%${SALE_CREDITO_TAG}%` } },
+    { paymentMethod: "credito" },
   ],
 };
 
 /** POST /orders/pos/checkout — venta desde caja con turno abierto. */
 export const posCheckout = async (req, res) => {
   try {
+    await ensureOrderItemPackSchema();
     const token = getHeaderToken(req);
     const user = await verifyJWT(token);
     const { accountId } = user;
 
-    const { customerId, notes, items, paymentMethod, saleType, documentType } = req.body;
+    const { customerId, notes, items, paymentMethod, saleType, documentType, cashRegisterId } =
+      req.body;
     if (!customerId || !Array.isArray(items) || items.length === 0) {
+      notifyFail("order.pos_checkout_failed", "Faltan customerId o items.", { req, httpStatus: 400 });
       return res.status(400).json({ message: "Faltan customerId o items." });
     }
 
     const notesText = String(notes || "");
     if (!notesText.includes(CAJA_POS_TAG)) {
+      notifyFail("order.pos_checkout_failed", "Pedido POS inválido (falta marca de caja).", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({ message: "Pedido POS inválido (falta marca de caja)." });
     }
 
@@ -52,9 +186,30 @@ export const posCheckout = async (req, res) => {
       : "consumidor_final";
     const shift = await findOpenShiftForAccount(accountId);
     if (!shift) {
+      notifyFail("order.pos_checkout_failed", "Abre un turno de caja antes de registrar ventas en el punto de venta.", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({
         message: "Abre un turno de caja antes de registrar ventas en el punto de venta.",
       });
+    }
+
+    let resolvedRegisterId = shift.activeCashRegisterId || null;
+    if (cashRegisterId != null && cashRegisterId !== "") {
+      const wanted = Number(cashRegisterId);
+      if (Number.isFinite(wanted)) {
+        const { CashRegister } = await import("../../models/CashRegister.js");
+        const reg = await CashRegister.findByPk(wanted);
+        if (!reg || !reg.isActive || (shift.storeId && reg.storeId !== shift.storeId)) {
+          notifyFail("order.pos_checkout_failed", "Caja no válida para este turno", {
+            req,
+            httpStatus: 400,
+          });
+          return res.status(400).json({ message: "La caja no pertenece al local del turno." });
+        }
+        resolvedRegisterId = reg.id;
+      }
     }
 
     const result = await sequelize.transaction(async (t) => {
@@ -66,6 +221,7 @@ export const posCheckout = async (req, res) => {
           date: now,
           status: isCredit ? "pendiente" : "pagado",
           shiftId: shift.id,
+          cashRegisterId: resolvedRegisterId,
           paymentMethod: isCredit ? "credito" : paymentMethod || "efectivo",
           paidAt: isCredit ? null : now,
           documentType: docType,
@@ -88,11 +244,23 @@ export const posCheckout = async (req, res) => {
         if (!product) throw new Error(`Producto #${productId} no encontrado.`);
 
         if (!isCredit) {
-          if (num(product.stock) < qty) {
-            throw new Error(`Stock insuficiente para ${product.name}. Disponible: ${product.stock}`);
+          const stockStoreId = shift.storeId || (await getDefaultStockStoreId({ transaction: t }));
+          if (!shift.storeId) {
+            throw new Error(
+              "El turno no tiene local asignado. Cierra y abre turno en una sucursal propia para vender con stock.",
+            );
           }
-          product.stock = num(product.stock) - qty;
-          await product.save({ transaction: t });
+          const available = await getStoreStockQty(stockStoreId, productId, { transaction: t });
+          if (available < qty) {
+            throw new Error(
+              `Stock insuficiente en este local para ${product.name}. Disponible: ${available}`,
+            );
+          }
+          await adjustStoreStock(stockStoreId, productId, -qty, {
+            transaction: t,
+            allowNegative: false,
+          });
+          await product.reload({ transaction: t });
 
           await InventoryMovement.create(
             {
@@ -104,7 +272,7 @@ export const posCheckout = async (req, res) => {
               referenceId: order.id,
               date: now,
               createdBy: accountId,
-              description: `Venta POS · pedido #${order.id}`,
+              description: `Venta POS · pedido #${order.id} · local #${stockStoreId}`,
             },
             { transaction: t },
           );
@@ -144,9 +312,15 @@ export const posCheckout = async (req, res) => {
       return order;
     });
 
+    notifyOk("order.pos_checkout", "Cobro en caja POS", { orderId: result.id });
     res.status(201).json({ ok: true, orderId: result.id, order: result });
   } catch (error) {
     console.error("posCheckout:", error);
+    notifyFail("order.pos_checkout_failed", error.message || "Error en checkout POS", {
+      error,
+      req,
+      httpStatus: 400,
+    });
     res.status(400).json({ message: error.message || "Error en checkout POS" });
   }
 };
@@ -156,6 +330,7 @@ const CAJA_POS_TAG_EXPORT = "[CAJA_POS]";
 /** GET /orders/pos/sales — ventas de caja para facturación e impresión. */
 export const getPosSales = async (req, res) => {
   try {
+    await ensureOrderItemPackSchema();
     const limit = Math.min(Number(req.query.limit) || 200, 500);
     const orders = await Order.findAll({
       where: {
@@ -306,8 +481,12 @@ export const updateOrderItem = async (req, res) => {
       req.body?.programmerDashboard === true || req.body?.programmerDashboard === "true";
     if (isDashboardCorrection) {
       if (user?.loginRol !== "Programador") {
+        notifyFail("order_item.programmer_corrected_failed", "No tenés permiso para esta acción", {
+          req,
+          httpStatus: 403,
+        });
         return res.status(403).json({
-          message: "Solo el rol Programador puede ejecutar esta acción",
+          message: "No tenés permiso para esta acción",
         });
       }
       return programmerDashboardOrderItemCorrection(req, res);
@@ -442,7 +621,24 @@ export const updateOrderItem = async (req, res) => {
           ? Number(updated.soldQty || 0)
           : Number(updated.quantity || 0);
 
-        if (updated.paidAt) {
+        // Si el ítem está en un grupo de cobranzas con abonos, el income es group_payment
+        // (no crear/actualizar "Pago ítem #" para no sumar el doble).
+        const groupLink = await ItemGroupItem.findOne({
+          where: { orderItemId: updated.id },
+          transaction: t,
+        });
+        let groupHasPayments = false;
+        if (groupLink?.groupId) {
+          const payCount = await Payment.count({
+            where: { groupId: groupLink.groupId, status: "completed" },
+            transaction: t,
+          });
+          groupHasPayments = payCount > 0;
+        }
+
+        if (groupHasPayments) {
+          if (existingIncome) await existingIncome.destroy({ transaction: t });
+        } else if (updated.paidAt) {
           const amount = Number((Number(updated.price || 0) * billableQty).toFixed(2));
           const concept = `Pago ítem #${updated.id} (Order #${updated.orderId})`;
 
@@ -490,9 +686,23 @@ export const updateOrderItem = async (req, res) => {
       return { status: 200, body: { message: "Ítem actualizado ✅", item: updated } };
     });
 
+    if (result.status >= 400) {
+      notifyFail(
+        "order_item.update_failed",
+        result.body?.message || "Error al actualizar ítem",
+        { req, httpStatus: result.status, extra: { itemId } },
+      );
+    } else {
+      notifyOk("order_item.updated", `Ítem pedido #${itemId}`, { itemId: Number(itemId) });
+    }
     return res.status(result.status).json(result.body);
   } catch (error) {
     console.error("updateOrderItem:", error);
+    notifyFail("order_item.update_failed", "Error al actualizar ítem", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     return res.status(500).json({
       message: "Error al actualizar ítem",
       error: String(error?.message || error),
@@ -574,7 +784,10 @@ export const closeOrderItemLogistics = async (req, res) => {
   const token = getHeaderToken(req);
   let user = null;
   try { user = await verifyJWT(token); }
-  catch { return res.status(401).json({ message: "No autorizado" }); }
+  catch {
+    notifyFail("order_item.update_failed", "No autorizado", { req, httpStatus: 401 });
+    return res.status(401).json({ message: "No autorizado" });
+  }
 
   try {
     const result = await sequelize.transaction(async (t) => {
@@ -651,9 +864,23 @@ export const closeOrderItemLogistics = async (req, res) => {
       return { status: 200, body: { message: "Cierre/logística guardado", item } };
     });
 
+    if (result.status >= 400) {
+      notifyFail(
+        "order_item.update_failed",
+        result.body?.message || "Error en cierre/logística",
+        { req, httpStatus: result.status, extra: { itemId } },
+      );
+    } else {
+      notifyOk("order_item.updated", `Cierre ítem pedido #${itemId}`, { itemId: Number(itemId) });
+    }
     return res.status(result.status).json(result.body);
   } catch (error) {
     console.error("closeOrderItemLogistics:", error);
+    notifyFail("order_item.update_failed", "Error en cierre/logística", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     return res.status(500).json({ message: "Error", error: String(error?.message || error) });
   }
 };
@@ -692,25 +919,47 @@ export const markItemAsPaid = async (req, res) => {
 
       const concept = `Venta ${productName} x${billableQty} a ${customerName} (Ord #${item.orderId}) $${num(item.price).toFixed(2)}`;
 
-      const [income, created] = await Income.findOrCreate({
-        where: { referenceType: "order_item", referenceId: item.id },
-        defaults: {
-          date: new Date(),
-          amount: itemTotal,
-          concept,
-          category: "Venta",
-          createdBy: user.accountId,
-          referenceType: "order_item",
-          referenceId: item.id,
-        },
+      // Si ya hay abono de grupo de cobranzas, no crear income por ítem (doble conteo).
+      const groupLink = await ItemGroupItem.findOne({
+        where: { orderItemId: item.id },
         transaction: t,
       });
+      let groupHasPayments = false;
+      if (groupLink?.groupId) {
+        const payCount = await Payment.count({
+          where: { groupId: groupLink.groupId, status: "completed" },
+          transaction: t,
+        });
+        groupHasPayments = payCount > 0;
+      }
 
-      if (!created) {
-        await income.update(
-          { amount: itemTotal, date: new Date(), concept, category: "Venta" },
-          { transaction: t }
-        );
+      let income = null;
+      if (groupHasPayments) {
+        await Income.destroy({
+          where: { referenceType: "order_item", referenceId: item.id },
+          transaction: t,
+        });
+      } else {
+        const [row, created] = await Income.findOrCreate({
+          where: { referenceType: "order_item", referenceId: item.id },
+          defaults: {
+            date: new Date(),
+            amount: itemTotal,
+            concept,
+            category: "Venta",
+            createdBy: user.accountId,
+            referenceType: "order_item",
+            referenceId: item.id,
+          },
+          transaction: t,
+        });
+        income = row;
+        if (!created) {
+          await income.update(
+            { amount: itemTotal, date: new Date(), concept, category: "Venta" },
+            { transaction: t }
+          );
+        }
       }
 
       // Recalcula estado del pedido
@@ -731,9 +980,23 @@ export const markItemAsPaid = async (req, res) => {
       return { status: 200, body: { message: "Ítem marcado como pagado", item, income } };
     });
 
+    if (result.status >= 400) {
+      notifyFail(
+        "order_item.mark_paid_failed",
+        result.body?.message || "Error al marcar ítem como pagado",
+        { req, httpStatus: result.status, extra: { itemId } },
+      );
+    } else {
+      notifyOk("order_item.mark_paid", `Ítem pagado #${itemId}`, { itemId: Number(itemId) });
+    }
     return res.status(result.status).json(result.body);
   } catch (error) {
     console.error("markItemAsPaid:", error);
+    notifyFail("order_item.mark_paid_failed", "Error al marcar ítem como pagado", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     return res.status(500).json({ message: "Error", error: String(error?.message || error) });
   }
 };
@@ -783,9 +1046,23 @@ export const unmarkItemAsPaid = async (req, res) => {
       return { status: 200, body: { message: "Pago revertido", item } };
     });
 
+    if (result.status >= 400) {
+      notifyFail(
+        "order_item.update_failed",
+        result.body?.message || "Error al revertir pago del ítem",
+        { req, httpStatus: result.status, extra: { itemId } },
+      );
+    } else {
+      notifyOk("order_item.updated", `Pago ítem revertido #${itemId}`, { itemId: Number(itemId) });
+    }
     return res.status(result.status).json(result.body);
   } catch (error) {
     console.error("unmarkItemAsPaid:", error);
+    notifyFail("order_item.update_failed", "Error al revertir pago del ítem", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     return res.status(500).json({ message: "Error", error: String(error?.message || error) });
   }
 };
@@ -793,6 +1070,7 @@ export const unmarkItemAsPaid = async (req, res) => {
 
 export const markItemAsDelivered = async (req, res) => {
   try {
+    await ensureOrderItemDeliverSchema();
     const { itemId } = req.params;
     const token = getHeaderToken(req);
     const user = await verifyJWT(token);
@@ -803,65 +1081,125 @@ export const markItemAsDelivered = async (req, res) => {
       ]
     });
 
-    if (!item) return res.status(404).json({ message: "Item not found" });
-    if (item.deliveredAt) return res.status(400).json({ message: "Este ítem ya fue marcado como entregado" });
+    if (!item) {
+      notifyFail("order_item.mark_delivered_failed", "Item not found", {
+        req,
+        httpStatus: 404,
+        extra: { itemId },
+      });
+      return res.status(404).json({ message: "Item not found" });
+    }
+    if (item.deliveredAt) {
+      notifyFail("order_item.mark_delivered_failed", "Este ítem ya fue marcado como entregado", {
+        req,
+        httpStatus: 400,
+        extra: { itemId },
+      });
+      return res.status(400).json({ message: "Este ítem ya fue marcado como entregado" });
+    }
 
     // ✅ si es panadería/consignación: NO descontar stock aquí
     const consignment = isConsignmentOrder(item);
     if (consignment) {
       item.deliveredAt = new Date();
       await item.save();
+      notifyOk("order_item.mark_delivered", `Ítem entregado #${itemId}`, { itemId: Number(itemId) });
       return res.json({
         message: "Ítem entregado (consignación). La salida real se registra con el cierre (vendido/dañado/yapa).",
         item
       });
     }
 
-    // ✅ modo normal: descontar stock y registrar movement de venta
-    const product = await InventoryProduct.findByPk(item.productId);
-    if (!product) return res.status(404).json({ message: "Producto no encontrado" });
+    const qty = num(item.quantity);
+    const multi = getAppSettingsSync()?.multiStockEnabled !== false;
 
-    if (num(product.stock) < num(item.quantity)) {
-      return res.status(400).json({ message: "Stock insuficiente para entregar este ítem" });
-    }
+    await sequelize.transaction(async (t) => {
+      const deliverStoreId = await resolveDeliverStoreId(req.body || {}, {
+        transaction: t,
+        requireExplicit: multi,
+      });
 
-    // stock
-    product.stock = num(product.stock) - num(item.quantity);
-    await product.save();
+      const product = await InventoryProduct.findByPk(item.productId, {
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+      if (!product) {
+        throw Object.assign(new Error("Producto no encontrado"), { status: 404 });
+      }
 
-    // movement
-    await InventoryMovement.create({
-      productId: item.productId,
-      quantity: num(item.quantity),
-      type: "salida",
-      reason: "SALIDA_VENTA",
-      referenceType: "order_item",
-      referenceId: item.id,
-      date: new Date(),
-      createdBy: user.accountId,
-      description: `Entrega venta normal (orderItem #${item.id})`
+      if (deliverStoreId) {
+        const available = await getStoreStockQty(deliverStoreId, product.id, { transaction: t });
+        if (available < qty) {
+          throw Object.assign(
+            new Error(
+              `Stock insuficiente en este local para entregar. Disponible: ${available}, pedido: ${qty}`,
+            ),
+            { status: 400 },
+          );
+        }
+        await adjustStoreStock(deliverStoreId, product.id, -qty, {
+          transaction: t,
+          allowNegative: false,
+        });
+      } else {
+        if (num(product.stock) < qty) {
+          throw Object.assign(new Error("Stock insuficiente para entregar este ítem"), {
+            status: 400,
+          });
+        }
+        await product.update({ stock: num(product.stock) - qty }, { transaction: t });
+      }
+
+      await InventoryMovement.create(
+        {
+          productId: item.productId,
+          quantity: qty,
+          type: "salida",
+          reason: "SALIDA_VENTA",
+          referenceType: "order_item",
+          referenceId: item.id,
+          date: new Date(),
+          createdBy: user.accountId,
+          description: deliverStoreId
+            ? `Entrega pedido (orderItem #${item.id}) · local #${deliverStoreId}`
+            : `Entrega venta normal (orderItem #${item.id})`,
+        },
+        { transaction: t },
+      );
+
+      item.deliveredAt = new Date();
+      if (deliverStoreId) item.deliveredStoreId = deliverStoreId;
+      await item.save({ transaction: t });
+
+      const allItems = await OrderItem.findAll({
+        where: { orderId: item.orderId },
+        transaction: t,
+      });
+      const allDelivered = allItems.every((i) => !!i.deliveredAt);
+      if (allDelivered) {
+        const order = await Order.findByPk(item.orderId, { transaction: t });
+        if (order && order.status !== "pagado") {
+          order.status = "entregado";
+          await order.save({ transaction: t });
+        }
+      }
     });
 
-    // deliveredAt
-    item.deliveredAt = new Date();
-    await item.save();
-
-    // estado pedido entregado si todos delivered
-    const allItems = await OrderItem.findAll({ where: { orderId: item.orderId } });
-    const allDelivered = allItems.every(i => !!i.deliveredAt);
-
-    if (allDelivered) {
-      const order = await Order.findByPk(item.orderId);
-      if (order && order.status !== "pagado") {
-        order.status = "entregado";
-        await order.save();
-      }
-    }
-
+    await item.reload();
+    notifyOk("order_item.mark_delivered", `Ítem entregado #${itemId}`, { itemId: Number(itemId) });
     res.json({ message: "Item delivered, stock updated, and movement recorded", item });
   } catch (error) {
     console.error("Error delivering item:", error);
-    res.status(500).json({ message: "Error delivering item", error: String(error?.message || error) });
+    const status = error?.status || 500;
+    notifyFail("order_item.mark_delivered_failed", error.message || "Error delivering item", {
+      error,
+      req,
+      httpStatus: status,
+    });
+    res.status(status).json({
+      message: error.message || "Error delivering item",
+      error: String(error?.message || error),
+    });
   }
 };
 
@@ -869,8 +1207,10 @@ export const markItemAsDelivered = async (req, res) => {
 export const createCustomer = async (req, res) => {
   try {
     const customer = await Customer.create(req.body);
+    notifyOk("customer.created", "Cliente creado", { customerId: customer.id });
     res.status(201).json(customer);
   } catch (error) {
+    notifyFail("customer.create_failed", "Error al crear cliente", { error, req, httpStatus: 500 });
     res.status(500).json({ message: 'Error al crear cliente', error });
   }
 };
@@ -878,9 +1218,11 @@ export const createCustomer = async (req, res) => {
 // Crear un nuevo pedido
 export const createOrder = async (req, res) => {
   try {
+    await ensureOrderItemPackSchema();
     const { customerId, notes, date, items } = req.body;
 
     if (!customerId || !items || items.length === 0) {
+      notifyFail("order.create_failed", "Faltan datos del pedido", { req, httpStatus: 400 });
       return res.status(400).json({ message: 'Faltan datos del pedido' });
     }
 
@@ -891,18 +1233,10 @@ export const createOrder = async (req, res) => {
     });
 
     const createdItems = await Promise.all(
-      items.map((item) =>
-        OrderItem.create({
-          orderId: order.id,
-          productId: item.productId,
-          quantity: item.quantity,
-          price: item.price,
-          statusEntrega: false,
-          statusPago: false,
-        })
-      )
+      items.map((item) => OrderItem.create(buildCustomerItemPayload(order.id, item)))
     );
 
+    notifyOk("order.created", `Pedido #${order.id}`, { orderId: order.id, customerId });
     res.status(201).json({
       message: "Pedido registrado correctamente",
       order,
@@ -910,7 +1244,8 @@ export const createOrder = async (req, res) => {
     });
   } catch (error) {
     console.error("createOrder:", error);
-    res.status(500).json({ message: "Error al crear pedido" });
+    notifyFail("order.create_failed", "Error al crear pedido", { error, req, httpStatus: 500 });
+    res.status(500).json({ message: error?.message || "Error al crear pedido" });
   }
 };
 
@@ -920,17 +1255,31 @@ export const markOrderAsPaid = async (req, res) => {
     const { id } = req.params;
     const order = await Order.findByPk(id);
 
-    if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
+    if (!order) {
+      notifyFail("order.mark_paid_failed", `Pedido #${id} no encontrado`, { req, httpStatus: 404 });
+      return res.status(404).json({ message: 'Pedido no encontrado' });
+    }
 
     if (order.status === 'pagado') {
+      notifyFail("order.mark_paid_failed", "El pedido ya está marcado como pagado", {
+        req,
+        httpStatus: 400,
+        extra: { orderId: id },
+      });
       return res.status(400).json({ message: 'El pedido ya está marcado como pagado' });
     }
 
     order.status = 'pagado';
     await order.save();
 
+    notifyOk("order.mark_paid", `Pedido pagado #${id}`, { orderId: Number(id) });
     res.json({ message: 'Pedido marcado como pagado', order });
   } catch (error) {
+    notifyFail("order.mark_paid_failed", "Error al marcar pedido como pagado", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     res.status(500).json({ message: 'Error al marcar pedido como pagado', error });
   }
 };
@@ -938,20 +1287,36 @@ export const markOrderAsPaid = async (req, res) => {
 export const deleteOrderItem = async (req, res) => {
   try {
     const item = await OrderItem.findByPk(req.params.id);
-    if (!item) return res.status(404).json({ message: "Ítem no encontrado" });
+    if (!item) {
+      notifyFail("order_item.delete_failed", `Ítem #${req.params.id} no encontrado`, {
+        req,
+        httpStatus: 404,
+      });
+      return res.status(404).json({ message: "Ítem no encontrado" });
+    }
     await item.destroy();
+    notifyOk("order_item.deleted", `Ítem pedido #${req.params.id}`, { itemId: Number(req.params.id) });
     res.json({ message: "Ítem eliminado correctamente" });
   } catch (error) {
+    notifyFail("order_item.delete_failed", "Error al eliminar ítem", { error, req, httpStatus: 500 });
     res.status(500).json({ message: "Error al eliminar ítem", error });
   }
 };
 export const deleteOrder = async (req, res) => {
   try {
     const order = await Order.findByPk(req.params.id);
-    if (!order) return res.status(404).json({ message: "Orden no encontrado" });
+    if (!order) {
+      notifyFail("order.delete_failed", `Pedido #${req.params.id} no encontrado`, {
+        req,
+        httpStatus: 404,
+      });
+      return res.status(404).json({ message: "Orden no encontrado" });
+    }
     await order.destroy();
+    notifyOk("order.deleted", `Pedido #${req.params.id}`, { orderId: Number(req.params.id) });
     res.json({ message: "Orden eliminado correctamente" });
   } catch (error) {
+    notifyFail("order.delete_failed", "Error al eliminar Orden", { error, req, httpStatus: 500 });
     res.status(500).json({ message: "Error al eliminar Orden", error });
   }
 };
@@ -959,64 +1324,117 @@ export const deleteOrder = async (req, res) => {
 export const updateOrder = async (req, res) => {
   try {
     const { id } = req.params;
-    // Permitimos updates parciales solo en estos campos
-    const { customerId, notes, date } = req.body ?? {};
+    const { customerId, notes, date, items } = req.body ?? {};
 
     const token = getHeaderToken(req);
     const user = await verifyJWT(token);
 
     const order = await Order.findByPk(id);
     if (!order) {
+      notifyFail("order.update_failed", `Pedido #${id} no encontrado`, { req, httpStatus: 404 });
       return res.status(404).json({ message: 'Pedido no encontrado' });
     }
 
-    // Bloqueo por estado si no es Admin/Programador
     const isPrivileged = ['Administrador', 'Programador'].includes(user?.loginRol);
     if (['entregado', 'pagado'].includes(order.status) && !isPrivileged) {
+      notifyFail("order.update_failed", `No tiene permisos para editar pedidos ${order.status}`, {
+        req,
+        httpStatus: 403,
+        extra: { orderId: id },
+      });
       return res.status(403).json({
         message: `No tiene permisos para editar pedidos ${order.status}`,
       });
     }
 
-    // Construimos el payload de actualización SOLO con campos presentes
     const updates = {};
 
     if (typeof customerId !== 'undefined') {
-      // Validación simple
       if (customerId === null || Number.isNaN(Number(customerId))) {
+        notifyFail("order.update_failed", "customerId inválido", { req, httpStatus: 400, extra: { orderId: id } });
         return res.status(400).json({ message: 'customerId inválido' });
       }
       updates.customerId = customerId;
     }
 
     if (typeof notes !== 'undefined') {
-      // Sanitizar/limitar si quieres (ej. longitud)
       updates.notes = String(notes);
     }
 
     if (typeof date !== 'undefined') {
-      // Acepta Date ISO o string "YYYY-MM-DDTHH:mm:ss"
       const parsed = new Date(date);
       if (isNaN(parsed.getTime())) {
+        notifyFail("order.update_failed", "Formato de fecha inválido", { req, httpStatus: 400, extra: { orderId: id } });
         return res.status(400).json({ message: 'Formato de fecha inválido' });
       }
-      updates.date = parsed; // Sequelize DATE/DATETIME
+      updates.date = parsed;
     }
 
-    // Si no hay nada que actualizar:
-    if (Object.keys(updates).length === 0) {
+    const hasItems = Array.isArray(items);
+    if (!hasItems && Object.keys(updates).length === 0) {
+      notifyFail("order.update_failed", "No se enviaron campos válidos para actualizar", {
+        req,
+        httpStatus: 400,
+        extra: { orderId: id },
+      });
       return res.status(400).json({ message: 'No se enviaron campos válidos para actualizar' });
     }
 
-    await order.update(updates);
+    if (hasItems) {
+      await ensureOrderItemPackSchema();
+      if (items.length === 0) {
+        notifyFail("order.update_failed", "El pedido debe tener al menos un producto", {
+          req,
+          httpStatus: 400,
+          extra: { orderId: id },
+        });
+        return res.status(400).json({ message: 'El pedido debe tener al menos un producto' });
+      }
+    }
 
-    // Opcional: vuelve a cargar asociaciones mínimas si las necesitas en el front
-    // await order.reload({ include: [Customer] });
+    await sequelize.transaction(async (transaction) => {
+      if (Object.keys(updates).length > 0) {
+        await order.update(updates, { transaction });
+      }
 
+      if (!hasItems) return;
+
+      const existing = await OrderItem.findAll({
+        where: { orderId: order.id },
+        transaction,
+      });
+      const byId = new Map(existing.map((it) => [Number(it.id), it]));
+      const keepIds = new Set();
+
+      for (const row of items) {
+        const payload = buildCustomerItemPayload(order.id, row);
+        const rowId = row?.id != null ? Number(row.id) : null;
+        const found = Number.isFinite(rowId) ? byId.get(rowId) : null;
+        if (found) {
+          await found.update(payload, { transaction });
+          keepIds.add(Number(found.id));
+        } else {
+          const created = await OrderItem.create(payload, { transaction });
+          keepIds.add(Number(created.id));
+        }
+      }
+
+      for (const it of existing) {
+        if (!keepIds.has(Number(it.id))) {
+          await it.destroy({ transaction });
+        }
+      }
+    });
+
+    notifyOk("order.updated", `Pedido #${id}`, { orderId: Number(id) });
     return res.json({ message: "Pedido actualizado correctamente", order });
   } catch (error) {
     console.error('Error al actualizar pedido:', error);
-    return res.status(500).json({ message: 'Error al actualizar pedido', error: String(error?.message || error) });
+    notifyFail("order.update_failed", "Error al actualizar pedido", { error, req, httpStatus: 500 });
+    return res.status(500).json({
+      message: error?.message || 'Error al actualizar pedido',
+      error: String(error?.message || error),
+    });
   }
 };
 
@@ -1031,13 +1449,21 @@ export const addOrderItem = async (req, res) => {
 
     const isPrivileged = ['Administrador', 'Programador'].includes(user?.loginRol);
     if (!isPrivileged) {
+      notifyFail("order_item.create_failed", "No tenés permiso para agregar productos a un pedido existente", {
+        req,
+        httpStatus: 403,
+      });
       return res.status(403).json({
-        message: 'Solo Administrador o Programador pueden agregar productos a un pedido existente',
+        message: 'No tenés permiso para agregar productos a un pedido existente',
       });
     }
 
     const order = await Order.findByPk(orderId);
     if (!order) {
+      notifyFail("order_item.create_failed", `Pedido #${orderId} no encontrado`, {
+        req,
+        httpStatus: 404,
+      });
       return res.status(404).json({ message: 'Pedido no encontrado' });
     }
 
@@ -1045,17 +1471,21 @@ export const addOrderItem = async (req, res) => {
     const qty = Number(quantity);
     const pr = Number(price);
     if (!Number.isFinite(pid) || pid <= 0) {
+      notifyFail("order_item.create_failed", "productId inválido", { req, httpStatus: 400, extra: { orderId } });
       return res.status(400).json({ message: 'productId inválido' });
     }
     if (!Number.isFinite(qty) || qty <= 0) {
+      notifyFail("order_item.create_failed", "Cantidad inválida", { req, httpStatus: 400, extra: { orderId } });
       return res.status(400).json({ message: 'Cantidad inválida' });
     }
     if (!Number.isFinite(pr) || pr < 0) {
+      notifyFail("order_item.create_failed", "Precio inválido", { req, httpStatus: 400, extra: { orderId } });
       return res.status(400).json({ message: 'Precio inválido' });
     }
 
     const product = await InventoryProduct.findByPk(pid);
     if (!product) {
+      notifyFail("order_item.create_failed", "Producto no encontrado", { req, httpStatus: 404, extra: { orderId } });
       return res.status(404).json({ message: 'Producto no encontrado' });
     }
 
@@ -1066,9 +1496,18 @@ export const addOrderItem = async (req, res) => {
       price: pr,
     });
 
+    notifyOk("order_item.created", `Ítem pedido #${orderId}`, {
+      orderId: order.id,
+      itemId: item.id,
+    });
     return res.status(201).json({ message: 'Ítem agregado', item });
   } catch (error) {
     console.error('addOrderItem:', error);
+    notifyFail("order_item.create_failed", "Error al agregar ítem al pedido", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     return res.status(500).json({
       message: 'Error al agregar ítem al pedido',
       error: String(error?.message || error),
@@ -1087,12 +1526,21 @@ export const updateOrderStatus = async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
     const order = await Order.findByPk(id);
-    if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
+    if (!order) {
+      notifyFail("order.status_change_failed", `Pedido #${id} no encontrado`, { req, httpStatus: 404 });
+      return res.status(404).json({ message: 'Pedido no encontrado' });
+    }
 
     order.status = status;
     await order.save();
+    notifyOk("order.status_changed", `Estado pedido #${id}`, { orderId: Number(id), status });
     res.json({ message: 'Estado actualizado', order });
   } catch (error) {
+    notifyFail("order.status_change_failed", "Error al actualizar estado del pedido", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     res.status(500).json({ message: 'Error al actualizar estado del pedido', error });
   }
 };
@@ -1115,13 +1563,25 @@ export const programmerDashboardOrderItemCorrection = async (req, res) => {
 
   try {
     const item = await OrderItem.findByPk(itemId);
-    if (!item) return res.status(404).json({ message: "Ítem no encontrado" });
+    if (!item) {
+      notifyFail("order_item.programmer_corrected_failed", "Ítem no encontrado", {
+        req,
+        httpStatus: 404,
+        extra: { itemId },
+      });
+      return res.status(404).json({ message: "Ítem no encontrado" });
+    }
 
     const itemPayload = {};
     const logParts = [];
 
     const delParsed = parseDateField(deliveredAt);
     if (delParsed === "__INVALID__") {
+      notifyFail("order_item.programmer_corrected_failed", "Fecha de entrega inválida", {
+        req,
+        httpStatus: 400,
+        extra: { itemId },
+      });
       return res.status(400).json({ message: "Fecha de entrega inválida" });
     }
     if (delParsed !== undefined) {
@@ -1133,6 +1593,11 @@ export const programmerDashboardOrderItemCorrection = async (req, res) => {
 
     const paidParsed = parseDateField(paidAt);
     if (paidParsed === "__INVALID__") {
+      notifyFail("order_item.programmer_corrected_failed", "Fecha de pago inválida", {
+        req,
+        httpStatus: 400,
+        extra: { itemId },
+      });
       return res.status(400).json({ message: "Fecha de pago inválida" });
     }
     if (paidParsed !== undefined) {
@@ -1149,13 +1614,25 @@ export const programmerDashboardOrderItemCorrection = async (req, res) => {
 
     if ((stockTouched || minTouched) && pid) {
       productRow = await InventoryProduct.findByPk(pid);
-      if (!productRow) return res.status(404).json({ message: "Producto no encontrado" });
+      if (!productRow) {
+        notifyFail("order_item.programmer_corrected_failed", "Producto no encontrado", {
+          req,
+          httpStatus: 404,
+          extra: { itemId },
+        });
+        return res.status(404).json({ message: "Producto no encontrado" });
+      }
     }
 
     const productUpdates = {};
     if (productRow && stockTouched) {
       const n = Number(stock);
       if (!Number.isFinite(n) || n < 0) {
+        notifyFail("order_item.programmer_corrected_failed", "Stock inválido", {
+          req,
+          httpStatus: 400,
+          extra: { itemId },
+        });
         return res.status(400).json({ message: "Stock inválido" });
       }
       productUpdates.stock = n;
@@ -1163,6 +1640,11 @@ export const programmerDashboardOrderItemCorrection = async (req, res) => {
     if (productRow && minTouched) {
       const n = Number(minStock);
       if (!Number.isFinite(n) || n < 0) {
+        notifyFail("order_item.programmer_corrected_failed", "Stock mínimo inválido", {
+          req,
+          httpStatus: 400,
+          extra: { itemId },
+        });
         return res.status(400).json({ message: "Stock mínimo inválido" });
       }
       productUpdates.minStock = n;
@@ -1172,6 +1654,11 @@ export const programmerDashboardOrderItemCorrection = async (req, res) => {
       !Object.keys(itemPayload).length &&
       !Object.keys(productUpdates).length
     ) {
+      notifyFail("order_item.programmer_corrected_failed", "No hay cambios para registrar", {
+        req,
+        httpStatus: 400,
+        extra: { itemId },
+      });
       return res.status(400).json({ message: "No hay cambios para registrar" });
     }
 
@@ -1245,12 +1732,21 @@ export const programmerDashboardOrderItemCorrection = async (req, res) => {
         }
       : null;
 
+    notifyOk("order_item.programmer_corrected", `Corrección ítem #${itemId}`, {
+      itemId: Number(itemId),
+      orderId: item.orderId,
+    });
     return res.json({
       message: "Cambios registrados (solo Logs, sin movimientos ni ingresos)",
       item: formatted,
     });
   } catch (error) {
     console.error("programmerDashboardOrderItemCorrection:", error);
+    notifyFail("order_item.programmer_corrected_failed", "Error al registrar corrección", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     return res.status(500).json({
       message: "Error al registrar corrección",
       error: error.message,
@@ -1260,8 +1756,9 @@ export const programmerDashboardOrderItemCorrection = async (req, res) => {
 
 export const getOrderStatusWorkbench = async (req, res) => {
   try {
+    await ensureOrderItemPackSchema();
     const orders = await Order.findAll({
-      where: nonCajaPosNotesWhere,
+      where: pedidosListNotesWhere,
       include: [
         { model: Customer, as: "ERP_customer" },
         {
@@ -1279,7 +1776,7 @@ export const getOrderStatusWorkbench = async (req, res) => {
       order: [["date", "DESC"]],
     });
 
-    const formatted = formatOrdersList(orders).map((order) => ({
+    const formatted = (await formatOrdersList(orders)).map((order) => ({
       ...order,
       ERP_order_items: order.ERP_order_items.map((item) => ({
         ...item,
@@ -1320,25 +1817,171 @@ export const getOrderStatusWorkbench = async (req, res) => {
 };
 
 // Obtener pedidos con items y cliente. Query opcional: ?from=YYYY-MM-DD&to=YYYY-MM-DD
-function formatOrdersList(orders) {
-  return orders.map((order) => {
-    const formattedItems = order.ERP_order_items.map((item) => ({
-      ...item.toJSON(),
-      paidAt: item.paidAt
-        ? format(new Date(item.paidAt), "dd/MM/yyyy HH:mm:ss", { locale: es })
-        : null,
-      deliveredAt: item.deliveredAt
-        ? format(new Date(item.deliveredAt), "dd/MM/yyyy HH:mm:ss", { locale: es })
-        : null,
-    }));
+/**
+ * Formatea pedidos de cliente e incluye paidAmount/remainingAmount según abonos
+ * de grupos de cobranzas (misma lógica que proveedores: progreso por monto).
+ */
+async function formatOrdersList(orders) {
+  const list = Array.isArray(orders) ? orders : [];
+  const baseRows = list.map((order) => {
+    const itemsSrc = order.ERP_order_items || [];
+    const formattedItems = itemsSrc.map((item) => {
+      const raw = typeof item.toJSON === "function" ? item.toJSON() : { ...item };
+      return {
+        ...raw,
+        paidAt: item.paidAt
+          ? format(new Date(item.paidAt), "dd/MM/yyyy HH:mm:ss", { locale: es })
+          : null,
+        deliveredAt: item.deliveredAt
+          ? format(new Date(item.deliveredAt), "dd/MM/yyyy HH:mm:ss", { locale: es })
+          : null,
+      };
+    });
 
+    const orderJson = typeof order.toJSON === "function" ? order.toJSON() : { ...order };
     return {
-      ...order.toJSON(),
+      ...orderJson,
       orderKind: "customer",
       date: format(new Date(order.date), "dd/MM/yyyy HH:mm:ss", { locale: es }),
       createdAt: format(new Date(order.createdAt), "dd/MM/yyyy HH:mm:ss", { locale: es }),
       updatedAt: format(new Date(order.updatedAt), "dd/MM/yyyy HH:mm:ss", { locale: es }),
       ERP_order_items: formattedItems,
+    };
+  });
+
+  const allItemIds = [];
+  const itemBillableById = new Map();
+  const orderIdByItemId = new Map();
+
+  for (const row of baseRows) {
+    for (const it of row.ERP_order_items || []) {
+      const id = Number(it.id);
+      if (!Number.isFinite(id)) continue;
+      allItemIds.push(id);
+      itemBillableById.set(id, orderItemBillableTotal(it));
+      orderIdByItemId.set(id, Number(row.id));
+    }
+  }
+
+  /** groupId -> paidAmount (pagos completed) */
+  const paidByGroupId = new Map();
+  /** groupId -> Map<itemId, billable> (todos los ítems del grupo) */
+  const groupItemTotals = new Map();
+
+  if (allItemIds.length > 0) {
+    const linkRows = await ItemGroupItem.findAll({
+      where: { orderItemId: { [Op.in]: allItemIds } },
+      attributes: ["groupId", "orderItemId"],
+    });
+    const groupIds = [
+      ...new Set(
+        linkRows
+          .map((r) => Number(r.groupId))
+          .filter((gid) => Number.isFinite(gid))
+      ),
+    ];
+
+    if (groupIds.length > 0) {
+      const [allGroupLinks, payments] = await Promise.all([
+        ItemGroupItem.findAll({
+          where: { groupId: { [Op.in]: groupIds } },
+          attributes: ["groupId", "orderItemId"],
+        }),
+        Payment.findAll({
+          where: { groupId: { [Op.in]: groupIds }, status: "completed" },
+          attributes: ["groupId", "amount"],
+        }),
+      ]);
+
+      const missingItemIds = [
+        ...new Set(
+          allGroupLinks
+            .map((r) => Number(r.orderItemId))
+            .filter((id) => Number.isFinite(id) && !itemBillableById.has(id))
+        ),
+      ];
+      if (missingItemIds.length > 0) {
+        const extraItems = await OrderItem.findAll({
+          where: { id: { [Op.in]: missingItemIds } },
+          attributes: ["id", "quantity", "price", "damagedQty", "giftQty"],
+        });
+        for (const it of extraItems) {
+          itemBillableById.set(Number(it.id), orderItemBillableTotal(it));
+        }
+      }
+
+      for (const r of allGroupLinks) {
+        const gid = Number(r.groupId);
+        const iid = Number(r.orderItemId);
+        if (!Number.isFinite(gid) || !Number.isFinite(iid)) continue;
+        if (!groupItemTotals.has(gid)) groupItemTotals.set(gid, new Map());
+        groupItemTotals.get(gid).set(iid, num(itemBillableById.get(iid) || 0));
+      }
+
+      for (const p of payments) {
+        const gid = Number(p.groupId);
+        if (!Number.isFinite(gid)) continue;
+        paidByGroupId.set(
+          gid,
+          Number(((paidByGroupId.get(gid) || 0) + num(p.amount)).toFixed(2))
+        );
+      }
+    }
+  }
+
+  /** Abono atribuido a cada pedido (proporción del grupo + ítems pagados fuera de grupo). */
+  const paidByOrderId = new Map();
+
+  for (const [gid, itemMap] of groupItemTotals.entries()) {
+    const groupTotal = Number(
+      [...itemMap.values()].reduce((s, v) => s + num(v), 0).toFixed(2)
+    );
+    const groupPaid = num(paidByGroupId.get(gid) || 0);
+    if (groupTotal <= 0 || groupPaid <= 0) continue;
+
+    const shareByOrder = new Map();
+    for (const [iid, lineTotal] of itemMap.entries()) {
+      const oid = orderIdByItemId.get(iid);
+      if (!Number.isFinite(oid)) continue;
+      shareByOrder.set(oid, Number(((shareByOrder.get(oid) || 0) + num(lineTotal)).toFixed(2)));
+    }
+    for (const [oid, share] of shareByOrder.entries()) {
+      const alloc = Number(((groupPaid * share) / groupTotal).toFixed(2));
+      paidByOrderId.set(
+        oid,
+        Number(((paidByOrderId.get(oid) || 0) + alloc).toFixed(2))
+      );
+    }
+  }
+
+  return baseRows.map((row) => {
+    const items = row.ERP_order_items || [];
+    const totalAmount = Number(
+      items.reduce((s, it) => s + orderItemBillableTotal(it), 0).toFixed(2)
+    );
+
+    let paidAmount = num(paidByOrderId.get(Number(row.id)) || 0);
+
+    // Piso: ítems ya marcados como pagados (legacy / cierre de grupo).
+    const paidAtFloor = Number(
+      items
+        .filter((it) => !!it.paidAt)
+        .reduce((s, it) => s + orderItemBillableTotal(it), 0)
+        .toFixed(2)
+    );
+    if (paidAmount <= 0.009 && items.length > 0 && items.every((it) => !!it.paidAt)) {
+      paidAmount = totalAmount;
+    } else {
+      paidAmount = Number(Math.max(paidAmount, paidAtFloor).toFixed(2));
+    }
+    paidAmount = Number(Math.min(paidAmount, totalAmount).toFixed(2));
+    const remainingAmount = Number(Math.max(0, totalAmount - paidAmount).toFixed(2));
+
+    return {
+      ...row,
+      totalAmount,
+      paidAmount,
+      remainingAmount,
     };
   });
 }
@@ -1353,12 +1996,13 @@ function parseRangeDate(value, endOfDay = false) {
 
 export const getAllOrders = async (req, res) => {
   try {
+    await ensureOrderItemPackSchema();
     const fromDate = parseRangeDate(req.query.from, false);
     const toDate = parseRangeDate(req.query.to, true);
     const pagination = parsePagination(req, { defaultPageSize: 100 });
 
     const where = {
-      ...nonCajaPosNotesWhere,
+      ...pedidosListNotesWhere,
     };
     if (fromDate || toDate) {
       where.date = {};
@@ -1389,7 +2033,7 @@ export const getAllOrders = async (req, res) => {
         include,
         order: [["date", "DESC"]],
       });
-      return res.json(formatOrdersList(orders));
+      return res.json(await formatOrdersList(orders));
     }
 
     const { count, rows } = await Order.findAndCountAll({
@@ -1402,7 +2046,7 @@ export const getAllOrders = async (req, res) => {
     });
 
     return sendPaginated(res, {
-      rows: formatOrdersList(rows),
+      rows: await formatOrdersList(rows),
       total: count,
       page: pagination.page,
       pageSize: pagination.pageSize,

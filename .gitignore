@@ -19,6 +19,15 @@ backend/database.db
 # Dump completo de producción (incluye users/hashes); el catálogo limpio sí se versiona
 backup-tienda.json
 
+# Imágenes de catálogo / subidas (no versionar; viven en cada servidor)
+backend/src/img/sistema/products/
+backend/src/img/sistema/stores/
+backend/src/img/sistema/ads/
+backend/src/img/sistema/qr/
+backend/src/img/photos/
+backend/src/img/qrBank/
+backend/src/img/products/
+
 # Sistema
 .DS_Store
 *.log

@@ -8,14 +8,143 @@ import {
   SupplierOrder,
   SupplierOrderItem,
 } from "../../models/Orders.js";
-import { InventoryProduct, InventoryMovement } from "../../models/Inventory.js";
+import { InventoryProduct, InventoryMovement, InventoryBatch, Store } from "../../models/Inventory.js";
 import { Expense, SupplierOrderPayment } from "../../models/Finance.js";
 import { getHeaderToken, verifyJWT } from "../../libs/jwt.js";
+import { notifyOk, notifyFail } from "../../services/notifyRaptorSolutions.js";
+import { ensureInventoryBatchesSchema } from "./BatchController.js";
+import { getAppSettingsSync } from "../../services/appSettingsService.js";
+import {
+  adjustStoreStock,
+  getDefaultStockStoreId,
+  storeHoldsInventory,
+} from "../../services/storeStockService.js";
 
 const toNum = (v, d = 0) => {
   const n = Number(v ?? d);
   return Number.isFinite(n) ? n : d;
 };
+
+let supplierItemLotSchemaReady = false;
+
+async function ensureSupplierOrderItemLotSchema() {
+  if (supplierItemLotSchemaReady) return;
+  const cols = [
+    ["packKey", "VARCHAR(64) NULL"],
+    ["packName", "VARCHAR(120) NULL"],
+    ["lotCode", "VARCHAR(80) NULL"],
+    ["expiresAt", "DATE NULL"],
+    ["manufacturedAt", "DATE NULL"],
+    ["inventoryBatchId", "INT NULL"],
+  ];
+  for (const [name, ddl] of cols) {
+    try {
+      const [found] = await sequelize.query(
+        `SHOW COLUMNS FROM \`ERP_supplier_order_items\` LIKE '${name}'`,
+      );
+      if (!Array.isArray(found) || found.length === 0) {
+        await sequelize.query(
+          `ALTER TABLE \`ERP_supplier_order_items\` ADD COLUMN \`${name}\` ${ddl}`,
+        );
+      }
+    } catch (e) {
+      console.warn(`ensureSupplierOrderItemLotSchema ${name}:`, e?.message || e);
+    }
+  }
+  try {
+    const [found] = await sequelize.query(
+      "SHOW COLUMNS FROM `ERP_supplier_orders` LIKE 'receivedStoreId'",
+    );
+    if (!Array.isArray(found) || found.length === 0) {
+      await sequelize.query(
+        "ALTER TABLE `ERP_supplier_orders` ADD COLUMN `receivedStoreId` INT NULL",
+      );
+    }
+  } catch (e) {
+    console.warn("ensureSupplierOrder receivedStoreId:", e?.message || e);
+  }
+  try {
+    await sequelize.query(
+      "ALTER TABLE `ERP_supplier_order_items` MODIFY COLUMN `unitPrice` DECIMAL(14,6) NOT NULL DEFAULT 0",
+    );
+  } catch (e) {
+    console.warn("ensureSupplierOrder unitPrice precision:", e?.message || e);
+  }
+  supplierItemLotSchemaReady = true;
+}
+
+/** null = stock general (sin multistock). Número = local inventariable. */
+async function resolveReceiveStoreId(body, { transaction, requireExplicit = false } = {}) {
+  const multi = getAppSettingsSync()?.multiStockEnabled !== false;
+  if (!multi) return null;
+
+  let sid =
+    body?.storeId != null && body.storeId !== ""
+      ? Number(body.storeId)
+      : null;
+  if (!Number.isFinite(sid) || sid <= 0) {
+    if (requireExplicit) {
+      throw new Error("Con multistock debes indicar Bodega o una sucursal para recibir.");
+    }
+    sid = await getDefaultStockStoreId({ transaction });
+  }
+  const store = await Store.findByPk(sid, { transaction });
+  if (!store || !storeHoldsInventory(store.locationKind)) {
+    throw new Error("El local de recepción debe ser Bodega o sucursal propia.");
+  }
+  return Number(store.id);
+}
+
+async function applyReceiveQty({ product, qty, storeId, transaction }) {
+  if (storeId) {
+    await adjustStoreStock(storeId, product.id, qty, {
+      transaction,
+      allowNegative: qty < 0,
+    });
+    return;
+  }
+  await product.update({ stock: toNum(product.stock) + qty }, { transaction });
+}
+
+function parseDayOnly(raw) {
+  if (raw == null || raw === "") return null;
+  const s = String(raw).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+/** Campos de paca/lote por línea (pedido proveedor). */
+function itemPackLotFields(row = {}) {
+  const packKey = row.packKey != null && String(row.packKey).trim()
+    ? String(row.packKey).trim().slice(0, 64)
+    : null;
+  const packName = row.packName != null && String(row.packName).trim()
+    ? String(row.packName).trim().slice(0, 120)
+    : null;
+  const lotCode = row.lotCode != null && String(row.lotCode).trim()
+    ? String(row.lotCode).trim().slice(0, 80)
+    : null;
+  const expiresAt = parseDayOnly(row.expiresAt);
+  const manufacturedAt = parseDayOnly(row.manufacturedAt);
+  if (manufacturedAt && expiresAt && manufacturedAt > expiresAt) {
+    throw new Error("La fecha de elaboración no puede ser posterior al vencimiento");
+  }
+  return { packKey, packName, lotCode, expiresAt, manufacturedAt };
+}
+
+function buildItemCreatePayload(orderId, row) {
+  const productId = Number(row.productId);
+  const quantity = toNum(row.quantity);
+  if (!productId || quantity <= 0) throw new Error("Ítem inválido en el pedido");
+  const lot = itemPackLotFields(row);
+  return {
+    orderId,
+    productId,
+    quantity,
+    unitPrice: toNum(row.unitPrice ?? row.price, 0),
+    taxRate: Math.max(0, toNum(row.taxRate, 0)),
+    ...lot,
+  };
+}
 
 function parseRangeDate(value, endOfDay = false) {
   if (!value || typeof value !== "string") return null;
@@ -118,6 +247,7 @@ async function formatSupplierOrdersList(orders) {
 
 export const getSupplierOrders = async (req, res) => {
   try {
+    await ensureSupplierOrderItemLotSchema();
     const fromDate = parseRangeDate(req.query.from, false);
     const toDate = parseRangeDate(req.query.to, true);
     const where = {};
@@ -141,16 +271,24 @@ export const getSupplierOrders = async (req, res) => {
 
 export const createSupplierOrder = async (req, res) => {
   try {
+    await ensureSupplierOrderItemLotSchema();
     const token = getHeaderToken(req);
     await verifyJWT(token);
     const { supplierId, date, notes, items = [] } = req.body || {};
 
     if (!supplierId || !date || !Array.isArray(items) || items.length === 0) {
+      notifyFail("supplier_order.create_failed", "Proveedor, fecha e ítems son requeridos", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({ message: "Proveedor, fecha e ítems son requeridos" });
     }
 
     const supplier = await Supplier.findByPk(supplierId);
-    if (!supplier) return res.status(404).json({ message: "Proveedor no encontrado" });
+    if (!supplier) {
+      notifyFail("supplier_order.create_failed", "Proveedor no encontrado", { req, httpStatus: 404 });
+      return res.status(404).json({ message: "Proveedor no encontrado" });
+    }
 
     const orderId = await sequelize.transaction(async (t) => {
       const order = await SupplierOrder.create(
@@ -164,54 +302,172 @@ export const createSupplierOrder = async (req, res) => {
       );
 
       for (const row of items) {
-        const productId = Number(row.productId);
-        const quantity = toNum(row.quantity);
-        if (!productId || quantity <= 0) throw new Error("Ítem inválido en el pedido");
-        const product = await InventoryProduct.findByPk(productId, { transaction: t });
-        if (!product) throw new Error(`Producto #${productId} no encontrado`);
-
-        await SupplierOrderItem.create(
-          {
-            orderId: order.id,
-            productId,
-            quantity,
-            unitPrice: toNum(row.unitPrice ?? row.price ?? product.price, 0),
-            taxRate: Math.max(0, toNum(row.taxRate, 0)),
-          },
-          { transaction: t }
-        );
+        const payload = buildItemCreatePayload(order.id, row);
+        const product = await InventoryProduct.findByPk(payload.productId, { transaction: t });
+        if (!product) throw new Error(`Producto #${payload.productId} no encontrado`);
+        await SupplierOrderItem.create(payload, { transaction: t });
       }
       return order.id;
     });
 
     const full = await SupplierOrder.findByPk(orderId, { include: orderIncludes });
+    notifyOk("supplier_order.created", "Pedido a proveedor creado", { supplierOrderId: orderId });
     res.status(201).json((await formatSupplierOrdersList([full]))[0]);
   } catch (error) {
     console.error("createSupplierOrder:", error);
+    notifyFail("supplier_order.create_failed", error.message || "Error al crear pedido a proveedor", {
+      error,
+      req,
+      httpStatus: 400,
+    });
     res.status(400).json({ message: error.message || "Error al crear pedido a proveedor" });
   }
 };
 
 export const updateSupplierOrder = async (req, res) => {
   try {
+    await ensureSupplierOrderItemLotSchema();
     const { id } = req.params;
     const { supplierId, date, notes, items, receivedAt, paidAt } = req.body || {};
     const order = await SupplierOrder.findByPk(id);
-    if (!order) return res.status(404).json({ message: "Pedido no encontrado" });
+    if (!order) {
+      notifyFail("supplier_order.update_failed", `Pedido proveedor #${id} no encontrado`, {
+        req,
+        httpStatus: 404,
+      });
+      return res.status(404).json({ message: "Pedido no encontrado" });
+    }
 
     const isReceived = Boolean(order.receivedAt);
     // Corrección manual de fechas (Programador): no re-dispara movimientos de stock.
     const hasDateOverride = receivedAt !== undefined || paidAt !== undefined;
+    const user = await verifyJWT(getHeaderToken(req));
+    const isProgramador = user?.loginRol === "Programador";
     if (hasDateOverride) {
-      const user = await verifyJWT(getHeaderToken(req));
-      if (user?.loginRol !== "Programador") {
+      if (!isProgramador) {
+        notifyFail("supplier_order.update_failed", "No tenés permiso para editar las fechas de entrega y pago", {
+          req,
+          httpStatus: 403,
+        });
         return res
           .status(403)
-          .json({ message: "Solo el rol Programador puede editar las fechas de entrega y pago" });
+          .json({ message: "No tenés permiso para editar las fechas de entrega y pago" });
       }
     }
-    if (isReceived && !hasDateOverride) {
+
+    /** Programador: editar ítems/precios de pedido recibido con saldo (modal completo). */
+    const wantsReceivedItemsEdit =
+      isReceived &&
+      !hasDateOverride &&
+      Array.isArray(items) &&
+      items.length > 0 &&
+      isProgramador;
+
+    if (isReceived && !hasDateOverride && !wantsReceivedItemsEdit) {
+      notifyFail("supplier_order.update_failed", "No se puede editar un pedido ya recibido", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({ message: "No se puede editar un pedido ya recibido" });
+    }
+
+    if (wantsReceivedItemsEdit) {
+      const fullForPay = await SupplierOrder.findByPk(id, { include: orderIncludes });
+      const [formatted] = await formatSupplierOrdersList([fullForPay]);
+      if (toNum(formatted?.remainingAmount) <= 0.009) {
+        notifyFail(
+          "supplier_order.update_failed",
+          "No se puede editar un pedido proveedor ya liquidado",
+          { req, httpStatus: 400 }
+        );
+        return res.status(400).json({
+          message: "No se puede editar un pedido proveedor ya liquidado",
+        });
+      }
+
+      await sequelize.transaction(async (t) => {
+        const oldItems = await SupplierOrderItem.findAll({
+          where: { orderId: order.id },
+          transaction: t,
+        });
+        const oldQtyByProduct = new Map();
+        for (const it of oldItems) {
+          const pid = Number(it.productId);
+          oldQtyByProduct.set(pid, toNum(oldQtyByProduct.get(pid)) + toNum(it.quantity));
+        }
+
+        const normalized = [];
+        const newQtyByProduct = new Map();
+        for (const row of items) {
+          const payload = buildItemCreatePayload(order.id, row);
+          if (payload.unitPrice < 0) throw new Error("Precio unitario inválido");
+          normalized.push(payload);
+          newQtyByProduct.set(
+            payload.productId,
+            toNum(newQtyByProduct.get(payload.productId)) + payload.quantity
+          );
+        }
+
+        const allProductIds = new Set([
+          ...oldQtyByProduct.keys(),
+          ...newQtyByProduct.keys(),
+        ]);
+        for (const productId of allProductIds) {
+          const delta =
+            toNum(newQtyByProduct.get(productId)) - toNum(oldQtyByProduct.get(productId));
+          if (delta === 0) continue;
+          const product = await InventoryProduct.findByPk(productId, { transaction: t });
+          if (!product) throw new Error(`Producto #${productId} no encontrado`);
+          const stockStoreId =
+            order.receivedStoreId != null
+              ? Number(order.receivedStoreId)
+              : await resolveReceiveStoreId({}, { transaction, requireExplicit: false });
+          await applyReceiveQty({
+            product,
+            qty: delta,
+            storeId: stockStoreId,
+            transaction: t,
+          });
+          await InventoryMovement.create(
+            {
+              productId,
+              type: delta > 0 ? "entrada" : "salida",
+              reason: delta > 0 ? "ENTRADA_COMPRA" : "AJUSTE_SALIDA",
+              quantity: Math.abs(delta),
+              description:
+                delta > 0
+                  ? `Ajuste recepción pedido proveedor #${order.id}`
+                  : `Ajuste reducción pedido proveedor #${order.id}`,
+              price: 0,
+              referenceType: "supplier_order",
+              referenceId: order.id,
+              createdBy: user.accountId,
+              date: order.receivedAt || nowApp(),
+            },
+            { transaction: t }
+          );
+        }
+
+        await order.update(
+          {
+            ...(supplierId != null ? { supplierId: Number(supplierId) } : {}),
+            ...(date ? { date: new Date(date) } : {}),
+            ...(notes !== undefined ? { notes: notes || null } : {}),
+          },
+          { transaction: t }
+        );
+
+        await SupplierOrderItem.destroy({ where: { orderId: order.id }, transaction: t });
+        for (const row of normalized) {
+          await SupplierOrderItem.create(row, { transaction: t });
+        }
+      });
+
+      const full = await SupplierOrder.findByPk(id, { include: orderIncludes });
+      notifyOk("supplier_order.updated", `Pedido proveedor #${id} (corrección post-recibo)`, {
+        supplierOrderId: Number(id),
+      });
+      return res.json((await formatSupplierOrdersList([full]))[0]);
     }
 
     await sequelize.transaction(async (t) => {
@@ -229,27 +485,22 @@ export const updateSupplierOrder = async (req, res) => {
       if (!isReceived && Array.isArray(items)) {
         await SupplierOrderItem.destroy({ where: { orderId: order.id }, transaction: t });
         for (const row of items) {
-          const productId = Number(row.productId);
-          const quantity = toNum(row.quantity);
-          if (!productId || quantity <= 0) throw new Error("Ítem inválido");
-          await SupplierOrderItem.create(
-            {
-              orderId: order.id,
-              productId,
-              quantity,
-              unitPrice: toNum(row.unitPrice ?? row.price, 0),
-              taxRate: Math.max(0, toNum(row.taxRate, 0)),
-            },
-            { transaction: t }
-          );
+          const payload = buildItemCreatePayload(order.id, row);
+          await SupplierOrderItem.create(payload, { transaction: t });
         }
       }
     });
 
     const full = await SupplierOrder.findByPk(id, { include: orderIncludes });
+    notifyOk("supplier_order.updated", `Pedido proveedor #${id}`, { supplierOrderId: Number(id) });
     res.json((await formatSupplierOrdersList([full]))[0]);
   } catch (error) {
     console.error("updateSupplierOrder:", error);
+    notifyFail("supplier_order.update_failed", error.message || "Error al actualizar pedido", {
+      error,
+      req,
+      httpStatus: 400,
+    });
     res.status(400).json({ message: error.message || "Error al actualizar pedido" });
   }
 };
@@ -261,14 +512,28 @@ export const addSupplierOrderItem = async (req, res) => {
     const user = await verifyJWT(token);
     const isPrivileged = ["Administrador", "Programador"].includes(user?.loginRol);
     if (!isPrivileged) {
+      notifyFail("supplier_order.item_add_failed", "No tenés permiso para agregar productos al pedido", {
+        req,
+        httpStatus: 403,
+      });
       return res.status(403).json({
-        message: "Solo Administrador o Programador pueden agregar productos al pedido",
+        message: "No tenés permiso para agregar productos al pedido",
       });
     }
 
     const order = await SupplierOrder.findByPk(req.params.id);
-    if (!order) return res.status(404).json({ message: "Pedido no encontrado" });
+    if (!order) {
+      notifyFail("supplier_order.item_add_failed", `Pedido proveedor #${req.params.id} no encontrado`, {
+        req,
+        httpStatus: 404,
+      });
+      return res.status(404).json({ message: "Pedido no encontrado" });
+    }
     if (order.receivedAt) {
+      notifyFail("supplier_order.item_add_failed", "No se pueden agregar productos a un pedido ya recibido", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({ message: "No se pueden agregar productos a un pedido ya recibido" });
     }
 
@@ -276,14 +541,22 @@ export const addSupplierOrderItem = async (req, res) => {
     const quantity = toNum(req.body?.quantity);
     const unitPrice = toNum(req.body?.unitPrice ?? req.body?.price, -1);
     if (!productId || quantity <= 0) {
+      notifyFail("supplier_order.item_add_failed", "Producto y cantidad válidos son requeridos", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({ message: "Producto y cantidad válidos son requeridos" });
     }
     if (unitPrice < 0) {
+      notifyFail("supplier_order.item_add_failed", "Precio unitario inválido", { req, httpStatus: 400 });
       return res.status(400).json({ message: "Precio unitario inválido" });
     }
 
     const product = await InventoryProduct.findByPk(productId);
-    if (!product) return res.status(404).json({ message: "Producto no encontrado" });
+    if (!product) {
+      notifyFail("supplier_order.item_add_failed", "Producto no encontrado", { req, httpStatus: 404 });
+      return res.status(404).json({ message: "Producto no encontrado" });
+    }
 
     const item = await SupplierOrderItem.create({
       orderId: order.id,
@@ -294,6 +567,10 @@ export const addSupplierOrderItem = async (req, res) => {
     });
 
     const full = await SupplierOrder.findByPk(order.id, { include: orderIncludes });
+    notifyOk("supplier_order.item_added", `Ítem pedido proveedor #${req.params.id}`, {
+      supplierOrderId: order.id,
+      itemId: item.id,
+    });
     res.status(201).json({
       message: "Producto agregado al pedido",
       item,
@@ -301,6 +578,11 @@ export const addSupplierOrderItem = async (req, res) => {
     });
   } catch (error) {
     console.error("addSupplierOrderItem:", error);
+    notifyFail("supplier_order.item_add_failed", error.message || "Error al agregar producto", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     res.status(500).json({ message: error.message || "Error al agregar producto" });
   }
 };
@@ -308,40 +590,175 @@ export const addSupplierOrderItem = async (req, res) => {
 export const deleteSupplierOrder = async (req, res) => {
   try {
     const order = await SupplierOrder.findByPk(req.params.id);
-    if (!order) return res.status(404).json({ message: "Pedido no encontrado" });
+    if (!order) {
+      notifyFail("supplier_order.delete_failed", `Pedido proveedor #${req.params.id} no encontrado`, {
+        req,
+        httpStatus: 404,
+      });
+      return res.status(404).json({ message: "Pedido no encontrado" });
+    }
     if (order.receivedAt) {
+      notifyFail("supplier_order.delete_failed", "No se puede eliminar un pedido ya recibido", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({ message: "No se puede eliminar un pedido ya recibido" });
     }
     await order.destroy();
+    notifyOk("supplier_order.deleted", `Pedido proveedor #${req.params.id}`, {
+      supplierOrderId: Number(req.params.id),
+    });
     res.json({ message: "Pedido a proveedor eliminado" });
   } catch (error) {
     console.error("deleteSupplierOrder:", error);
+    notifyFail("supplier_order.delete_failed", `Error al eliminar pedido #${req.params.id}`, {
+      error,
+      req,
+      httpStatus: 500,
+    });
     res.status(500).json({ message: "Error al eliminar pedido" });
   }
 };
 
 export const markSupplierOrderReceived = async (req, res) => {
   try {
+    await ensureSupplierOrderItemLotSchema();
+    await ensureInventoryBatchesSchema();
     const token = getHeaderToken(req);
     const user = await verifyJWT(token);
     const order = await SupplierOrder.findByPk(req.params.id, {
       include: [{ model: SupplierOrderItem, as: "ERP_supplier_order_items" }],
     });
-    if (!order) return res.status(404).json({ message: "Pedido no encontrado" });
+    if (!order) {
+      notifyFail("supplier_order.mark_received_failed", `Pedido proveedor #${req.params.id} no encontrado`, {
+        req,
+        httpStatus: 404,
+      });
+      return res.status(404).json({ message: "Pedido no encontrado" });
+    }
     if (order.receivedAt) {
+      notifyFail("supplier_order.mark_received_failed", "El pedido ya fue marcado como recibido", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({ message: "El pedido ya fue marcado como recibido" });
     }
 
     const receivedAt = req.body?.receivedAt ? new Date(req.body.receivedAt) : new Date();
 
     await sequelize.transaction(async (t) => {
-      for (const item of order.ERP_supplier_order_items || []) {
+      const receiveStoreId = await resolveReceiveStoreId(req.body || {}, {
+        transaction: t,
+        requireExplicit: getAppSettingsSync()?.multiStockEnabled !== false,
+      });
+      const items = order.ERP_supplier_order_items || [];
+
+      // Agrupar líneas con vencimiento → 1 lote por (producto + paca + lote + fechas).
+      const batchGroups = new Map();
+      const plainItems = [];
+
+      for (const item of items) {
+        const qty = toNum(item.quantity);
+        if (qty <= 0) continue;
+        const expiresAt = parseDayOnly(item.expiresAt);
+        if (expiresAt) {
+          const key = [
+            item.productId,
+            item.packKey || "",
+            item.lotCode || "",
+            expiresAt,
+            parseDayOnly(item.manufacturedAt) || "",
+          ].join("|");
+          if (!batchGroups.has(key)) {
+            batchGroups.set(key, {
+              productId: item.productId,
+              packKey: item.packKey || null,
+              packName: item.packName || null,
+              lotCode: item.lotCode || null,
+              expiresAt,
+              manufacturedAt: parseDayOnly(item.manufacturedAt),
+              quantity: 0,
+              unitPriceSum: 0,
+              itemIds: [],
+            });
+          }
+          const g = batchGroups.get(key);
+          g.quantity += qty;
+          g.unitPriceSum += toNum(item.unitPrice) * qty;
+          g.itemIds.push(item.id);
+        } else {
+          plainItems.push(item);
+        }
+      }
+
+      for (const g of batchGroups.values()) {
+        const product = await InventoryProduct.findByPk(g.productId, {
+          transaction: t,
+          lock: t.LOCK.UPDATE,
+        });
+        if (!product) continue;
+
+        const batch = await InventoryBatch.create(
+          {
+            productId: g.productId,
+            code: g.lotCode,
+            quantityInitial: g.quantity,
+            quantityRemaining: g.quantity,
+            expiresAt: g.expiresAt,
+            manufacturedAt: g.manufacturedAt,
+            receivedAt,
+            notes: g.packName
+              ? `Paca «${g.packName}» · pedido proveedor #${order.id}`
+              : `Pedido proveedor #${order.id}`,
+            status: "active",
+            createdBy: user.accountId,
+          },
+          { transaction: t },
+        );
+
+        await applyReceiveQty({
+          product,
+          qty: g.quantity,
+          storeId: receiveStoreId,
+          transaction: t,
+        });
+
+        await InventoryMovement.create(
+          {
+            productId: product.id,
+            type: "entrada",
+            reason: "ENTRADA_COMPRA",
+            quantity: g.quantity,
+            description: g.lotCode
+              ? `Recepción pedido #${order.id} · lote ${g.lotCode} (vence ${g.expiresAt})`
+              : `Recepción pedido #${order.id} · lote #${batch.id} (vence ${g.expiresAt})`,
+            price: g.unitPriceSum,
+            referenceType: "inventory_batch",
+            referenceId: batch.id,
+            createdBy: user.accountId,
+            date: receivedAt,
+          },
+          { transaction: t },
+        );
+
+        await SupplierOrderItem.update(
+          { inventoryBatchId: batch.id },
+          { where: { id: { [Op.in]: g.itemIds } }, transaction: t },
+        );
+      }
+
+      for (const item of plainItems) {
         const product = await InventoryProduct.findByPk(item.productId, { transaction: t });
         if (!product) continue;
         const qty = toNum(item.quantity);
         if (qty <= 0) continue;
 
-        await product.update({ stock: toNum(product.stock) + qty }, { transaction: t });
+        await applyReceiveQty({
+          product,
+          qty,
+          storeId: receiveStoreId,
+          transaction: t,
+        });
 
         await InventoryMovement.create(
           {
@@ -356,20 +773,29 @@ export const markSupplierOrderReceived = async (req, res) => {
             createdBy: user.accountId,
             date: receivedAt,
           },
-          { transaction: t }
+          { transaction: t },
         );
       }
 
       order.receivedAt = receivedAt;
       order.status = "recibido";
+      if (receiveStoreId) order.receivedStoreId = receiveStoreId;
       await order.save({ transaction: t });
     });
 
     const full = await SupplierOrder.findByPk(order.id, { include: orderIncludes });
+    notifyOk("supplier_order.mark_received", `Pedido recibido #${req.params.id}`, {
+      supplierOrderId: order.id,
+    });
     res.json((await formatSupplierOrdersList([full]))[0]);
   } catch (error) {
     console.error("markSupplierOrderReceived:", error);
-    res.status(500).json({ message: "Error al marcar pedido como recibido" });
+    notifyFail("supplier_order.mark_received_failed", "Error al marcar pedido como recibido", {
+      error,
+      req,
+      httpStatus: 500,
+    });
+    res.status(500).json({ message: error.message || "Error al marcar pedido como recibido" });
   }
 };
 
@@ -385,8 +811,18 @@ export const markSupplierOrderPaid = async (req, res) => {
         { model: SupplierOrderItem, as: "ERP_supplier_order_items" },
       ],
     });
-    if (!order) return res.status(404).json({ message: "Pedido no encontrado" });
+    if (!order) {
+      notifyFail("supplier_order.mark_paid_failed", `Pedido proveedor #${req.params.id} no encontrado`, {
+        req,
+        httpStatus: 404,
+      });
+      return res.status(404).json({ message: "Pedido no encontrado" });
+    }
     if (order.paidAt) {
+      notifyFail("supplier_order.mark_paid_failed", "El pedido ya fue marcado como pagado", {
+        req,
+        httpStatus: 400,
+      });
       return res.status(400).json({ message: "El pedido ya fue marcado como pagado" });
     }
 
@@ -446,9 +882,17 @@ export const markSupplierOrderPaid = async (req, res) => {
     });
 
     const full = await SupplierOrder.findByPk(order.id, { include: orderIncludes });
+    notifyOk("supplier_order.mark_paid", `Pedido proveedor pagado #${req.params.id}`, {
+      supplierOrderId: order.id,
+    });
     res.json((await formatSupplierOrdersList([full]))[0]);
   } catch (error) {
     console.error("markSupplierOrderPaid:", error);
+    notifyFail("supplier_order.mark_paid_failed", "Error al marcar pedido como pagado", {
+      error,
+      req,
+      httpStatus: 500,
+    });
     res.status(500).json({ message: "Error al marcar pedido como pagado" });
   }
 };

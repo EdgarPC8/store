@@ -30,6 +30,8 @@ export const DEFAULT_APP_SETTINGS = {
   showPublicCatalog: false,
   showPublicStoresPropia: false,
   showPublicStoresVitrina: false,
+  // Store: default un solo local; el gestor puede activar multistock vía feature multi_stock.
+  multiStockEnabled: false,
 };
 
 let cache = { ...DEFAULT_APP_SETTINGS };
@@ -170,6 +172,7 @@ async function ensureAppSettingsSchema() {
     ["showPublicCatalog", false],
     ["showPublicStoresPropia", false],
     ["showPublicStoresVitrina", false],
+    ["multiStockEnabled", false],
   ];
   for (const [col, def] of boolCols) {
     if (!table[col]) {
@@ -207,6 +210,7 @@ export async function loadAppSettings() {
     showPublicCatalog: asBool(raw.showPublicCatalog, false),
     showPublicStoresPropia: asBool(raw.showPublicStoresPropia, false),
     showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, false),
+    multiStockEnabled: asBool(raw.multiStockEnabled, false),
   };
   ensureStandardAssetDirs(cache.mediaFolderPrefix);
   return cache;
@@ -218,6 +222,7 @@ export async function updateAppSettings(payload) {
     "showPublicCatalog",
     "showPublicStoresPropia",
     "showPublicStoresVitrina",
+    "multiStockEnabled",
   ]) {
     if (key in patch) patch[key] = asBool(patch[key], false);
   }
@@ -234,6 +239,7 @@ export async function updateAppSettings(payload) {
     showPublicCatalog: asBool(raw.showPublicCatalog, false),
     showPublicStoresPropia: asBool(raw.showPublicStoresPropia, false),
     showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, false),
+    multiStockEnabled: asBool(raw.multiStockEnabled, false),
   };
   return cache;
 }
@@ -265,5 +271,6 @@ export function toPublicSettings(data = cache) {
     showPublicCatalog: asBool(data.showPublicCatalog, false),
     showPublicStoresPropia: asBool(data.showPublicStoresPropia, false),
     showPublicStoresVitrina: asBool(data.showPublicStoresVitrina, false),
+    multiStockEnabled: asBool(data.multiStockEnabled, false),
   };
 }

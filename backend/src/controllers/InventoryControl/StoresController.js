@@ -6,6 +6,7 @@ import fsp from "fs/promises";
 import fileDirName from "../../libs/file-dirname.js";
 import { mediaSubfolder } from "../../services/appSettingsService.js";
 import { Store } from "../../models/Inventory.js";
+import { notifyOk, notifyFail } from "../../services/notifyRaptorSolutions.js";
 
 const { __dirname } = fileDirName(import.meta);
 
@@ -63,9 +64,20 @@ export const createStore = async (req, res) => {
     if ("isActive" in payload) {
       payload.isActive = String(payload.isActive) === "true";
     }
+    if ("isVisible" in payload) {
+      payload.isVisible = String(payload.isVisible) === "true";
+    }
+    // Inactivo ⇒ no visible en home/punto de venta
+    if (payload.isActive === false) {
+      payload.isVisible = false;
+    } else if (payload.isVisible == null) {
+      payload.isVisible = true;
+    }
 
     const kind = String(payload.locationKind || "vitrina").trim().toLowerCase();
-    payload.locationKind = kind === "propia" ? "propia" : "vitrina";
+    if (kind === "propia") payload.locationKind = "propia";
+    else if (kind === "bodega") payload.locationKind = "bodega";
+    else payload.locationKind = "vitrina";
 
     const padCode = (v, fallback = "001") => {
       const d = String(v ?? "").replace(/\D/g, "").slice(-3);
@@ -76,9 +88,11 @@ export const createStore = async (req, res) => {
 
     // --- required mínimos ---
     if (!payload.name || !String(payload.name).trim()) {
+      notifyFail("store.create_failed", "El campo name es obligatorio", { req, httpStatus: 400 });
       return res.status(400).json({ message: "El campo 'name' es obligatorio." });
     }
     if (!payload.address || !String(payload.address).trim()) {
+      notifyFail("store.create_failed", "El campo address es obligatorio", { req, httpStatus: 400 });
       return res.status(400).json({ message: "El campo 'address' es obligatorio." });
     }
 
@@ -101,12 +115,18 @@ export const createStore = async (req, res) => {
     delete payload.moveImage;
 
     const row = await Store.create(payload);
+    if (row.locationKind === "propia") {
+      const { ensureDefaultCashRegisters } = await import("../../models/CashRegister.js");
+      await ensureDefaultCashRegisters(row);
+    }
+    notifyOk("store.created", `Local #${row.id}`, { store: row });
     return res.status(201).json({ message: "Creado", store: row });
   } catch (error) {
     // rollback: si subió imagen y falló el create, borra archivo
     if (tempRelPath) safeUnlink(imagePath(tempRelPath));
 
     console.error("Error createStore:", error);
+    notifyFail("store.create_failed", "Error al crear Store", { error, req, httpStatus: 500 });
     return res.status(500).json({ message: "Error al crear Store", error: error?.message || error });
   }
 };
@@ -119,7 +139,10 @@ export const updateStore = async (req, res) => {
   try {
     const { id } = req.params;
     const row = await Store.findByPk(id);
-    if (!row) return res.status(404).json({ message: "Store no encontrado" });
+    if (!row) {
+      notifyFail("store.update_failed", `Store #${id} no encontrado`, { req, httpStatus: 404 });
+      return res.status(404).json({ message: "Store no encontrado" });
+    }
 
     const oldRel = normalize(row.imageUrl || "");
     const incomingRel = normalize(req.body.imageUrl || "");
@@ -150,6 +173,11 @@ export const updateStore = async (req, res) => {
     else if (incomingRel && incomingRel !== oldRel) {
       const used = await isImageInUseElsewhere(oldRel, row.id);
       if (used) {
+        notifyFail("store.update_failed", "Imagen en uso por otros stores", {
+          req,
+          httpStatus: 400,
+          extra: { storeId: id },
+        });
         return res.status(400).json({
           message: "La imagen está siendo usada por otros stores. No se puede mover.",
         });
@@ -159,6 +187,11 @@ export const updateStore = async (req, res) => {
       const toAbs = imagePath(incomingRel);
 
       if (!fs.existsSync(fromAbs)) {
+        notifyFail("store.update_failed", "Imagen actual no existe en servidor", {
+          req,
+          httpStatus: 404,
+          extra: { storeId: id },
+        });
         return res.status(404).json({
           message: "La imagen actual no existe físicamente en el servidor",
         });
@@ -186,12 +219,24 @@ export const updateStore = async (req, res) => {
     if ("isActive" in updates) {
       updates.isActive = String(updates.isActive) === "true";
     }
+    if ("isVisible" in updates) {
+      updates.isVisible = String(updates.isVisible) === "true";
+    }
+    // Inactivo ⇒ forzar no visible (bodega/sucursal apagada no sale en home)
+    const nextActive =
+      "isActive" in updates ? updates.isActive : row.isActive !== false && row.isActive !== 0;
+    if (!nextActive) {
+      updates.isVisible = false;
+    }
+
     if ("name" in updates && updates.name != null) updates.name = String(updates.name).trim();
     if ("address" in updates && updates.address != null) updates.address = String(updates.address).trim();
 
     if ("locationKind" in updates) {
       const kind = String(updates.locationKind || "vitrina").trim().toLowerCase();
-      updates.locationKind = kind === "propia" ? "propia" : "vitrina";
+      if (kind === "propia") updates.locationKind = "propia";
+      else if (kind === "bodega") updates.locationKind = "bodega";
+      else updates.locationKind = "vitrina";
     }
 
     const padCode = (v, fallback = "001") => {
@@ -215,19 +260,27 @@ export const updateStore = async (req, res) => {
     // ===============================
     await row.update(updates);
 
+    if (row.locationKind === "propia") {
+      const { ensureDefaultCashRegisters } = await import("../../models/CashRegister.js");
+      await ensureDefaultCashRegisters(row);
+    }
+
+    notifyOk("store.updated", `Local #${id}`, { store: row });
+
     return res.json({
       message: moved ? "Store actualizado y la imagen fue movida" : "Store actualizado",
       store: row,
     });
   } catch (error) {
     console.error("Error updateStore:", error);
+    notifyFail("store.update_failed", "Error al actualizar Store", { error, req, httpStatus: 500 });
     return res.status(500).json({ message: "Error al actualizar Store", error: error?.message || error });
   }
 };
 
 export const getStores = async (req, res) => {
   try {
-    const { isActive, kind, locationKind } = req.query;
+    const { isActive, isVisible, kind, locationKind } = req.query;
 
     const where = {};
     if (isActive === "true" || isActive === true) {
@@ -236,8 +289,14 @@ export const getStores = async (req, res) => {
       where.isActive = false;
     }
 
+    if (isVisible === "true" || isVisible === true) {
+      where.isVisible = true;
+    } else if (isVisible === "false" || isVisible === false) {
+      where.isVisible = false;
+    }
+
     const kindFilter = String(kind || locationKind || "").trim().toLowerCase();
-    if (kindFilter === "propia" || kindFilter === "vitrina") {
+    if (kindFilter === "propia" || kindFilter === "vitrina" || kindFilter === "bodega") {
       where.locationKind = kindFilter;
     }
 
@@ -265,7 +324,10 @@ export const deleteStore = async (req, res) => {
   try {
     const { id } = req.params;
     const row = await Store.findByPk(id);
-    if (!row) return res.status(404).json({ message: "Store no encontrado" });
+    if (!row) {
+      notifyFail("store.delete_failed", `Store #${id} no encontrado`, { req, httpStatus: 404 });
+      return res.status(404).json({ message: "Store no encontrado" });
+    }
 
     if (row.imageUrl) {
       const used = await isImageInUseElsewhere(row.imageUrl, row.id);
@@ -273,8 +335,14 @@ export const deleteStore = async (req, res) => {
     }
 
     await row.destroy();
+    notifyOk("store.deleted", `Local #${id}`, { storeId: id });
     res.json({ message: "Store eliminado" });
   } catch (error) {
+    notifyFail("store.delete_failed", `Error al eliminar Store #${req.params.id}`, {
+      error,
+      req,
+      httpStatus: 500,
+    });
     res.status(500).json({ message: "Error al eliminar Store", error });
   }
 };

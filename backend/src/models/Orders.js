@@ -2,6 +2,7 @@ import { DataTypes, Sequelize } from 'sequelize';
 import { sequelize } from '../database/connection.js';
 import { InventoryProduct } from './Inventory.js';
 import { CashShift } from './CashShift.js';
+import { CashRegister } from './CashRegister.js';
 
 // Tabla de clientes
 export const Customer = sequelize.define("ERP_customers", {
@@ -40,6 +41,8 @@ export const Order = sequelize.define("ERP_orders", {
   },
   notes: { type: DataTypes.TEXT },
   shiftId: { type: DataTypes.INTEGER, allowNull: true },
+  /** Caja del local que registró la venta POS */
+  cashRegisterId: { type: DataTypes.INTEGER, allowNull: true },
   paymentMethod: { type: DataTypes.STRING(40), allowNull: true },
   paidAt: { type: DataTypes.DATE, allowNull: true },
   documentType: {
@@ -98,11 +101,19 @@ export const OrderItem = sequelize.define("ERP_order_items", {
     type: DataTypes.DATE,
     allowNull: true, // null means not delivered yet
   },
+  /** Local desde el que salió el stock al entregar (multistock). */
+  deliveredStoreId: { type: DataTypes.INTEGER, allowNull: true },
   paidAt: {
     type: DataTypes.DATE,
     allowNull: true,
     comment: "Fecha cuando quedó totalmente pagado (último pago)",
   },
+  /** Agrupa líneas en una paca del pedido a cliente. */
+  packKey: { type: DataTypes.STRING(64), allowNull: true },
+  packName: { type: DataTypes.STRING(120), allowNull: true },
+  lotCode: { type: DataTypes.STRING(80), allowNull: true },
+  expiresAt: { type: DataTypes.DATEONLY, allowNull: true },
+  manufacturedAt: { type: DataTypes.DATEONLY, allowNull: true },
   
   
 }, {
@@ -133,6 +144,8 @@ export const SupplierOrder = sequelize.define("ERP_supplier_orders", {
     defaultValue: "pendiente",
   },
   receivedAt: { type: DataTypes.DATE, allowNull: true },
+  /** Local donde entró el stock al marcar recibido (multistock). */
+  receivedStoreId: { type: DataTypes.INTEGER, allowNull: true },
   paidAt: { type: DataTypes.DATE, allowNull: true },
   paymentMethod: { type: DataTypes.STRING(40), allowNull: true },
   financeExpenseId: { type: DataTypes.INTEGER, allowNull: true },
@@ -145,13 +158,24 @@ export const SupplierOrderItem = sequelize.define("ERP_supplier_order_items", {
   orderId: { type: DataTypes.INTEGER, allowNull: false },
   productId: { type: DataTypes.INTEGER, allowNull: false },
   quantity: { type: DataTypes.FLOAT, allowNull: false },
-  unitPrice: { type: DataTypes.DECIMAL(10, 3), allowNull: false, defaultValue: 0 },
+  unitPrice: { type: DataTypes.DECIMAL(14, 6), allowNull: false, defaultValue: 0 },
   taxRate: {
     type: DataTypes.DECIMAL(5, 2),
     allowNull: false,
     defaultValue: 0,
     comment: "% IVA aplicado al ítem (0 = sin IVA)",
   },
+  /** Agrupa líneas en una paca del pedido (no es SupplierPack de cobranzas). */
+  packKey: { type: DataTypes.STRING(64), allowNull: true },
+  packName: { type: DataTypes.STRING(120), allowNull: true },
+  /** Código de lote / lote del proveedor. */
+  lotCode: { type: DataTypes.STRING(80), allowNull: true },
+  /** Fecha de vencimiento del lote (al recibir se crea InventoryBatch). */
+  expiresAt: { type: DataTypes.DATEONLY, allowNull: true },
+  /** Fecha de elaboración (opcional). */
+  manufacturedAt: { type: DataTypes.DATEONLY, allowNull: true },
+  /** Lote de inventario creado al recibir. */
+  inventoryBatchId: { type: DataTypes.INTEGER, allowNull: true },
 }, {
   timestamps: false,
 });
@@ -168,6 +192,9 @@ OrderItem.belongsTo(InventoryProduct, { foreignKey: "productId", as: "ERP_invent
 
 CashShift.hasMany(Order, { foreignKey: 'shiftId', as: 'orders' });
 Order.belongsTo(CashShift, { foreignKey: 'shiftId', as: 'shift' });
+
+CashRegister.hasMany(Order, { foreignKey: 'cashRegisterId', as: 'orders' });
+Order.belongsTo(CashRegister, { foreignKey: 'cashRegisterId', as: 'cashRegister' });
 
 Supplier.hasMany(SupplierOrder, { foreignKey: 'supplierId', onDelete: 'RESTRICT' });
 SupplierOrder.belongsTo(Supplier, { foreignKey: 'supplierId', as: 'ERP_supplier' });
