@@ -466,7 +466,7 @@ export function prepareBackupForRestore(jsonData) {
       if (next.showPublicStoresVitrina === undefined || next.showPublicStoresVitrina === null) {
         next.showPublicStoresVitrina = true;
       }
-      // Multistock: si el backup no trae el flag, Store arranca en un solo local.
+      // Multistock: si el backup no trae el flag, Store arranca en stock general.
       if (next.multiStockEnabled === undefined || next.multiStockEnabled === null) {
         next.multiStockEnabled = false;
       }

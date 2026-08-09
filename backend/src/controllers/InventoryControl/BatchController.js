@@ -1,12 +1,24 @@
 import { addDays, format, parseISO, isValid } from "date-fns";
 import { Op } from "sequelize";
 import { sequelize } from "../../database/connection.js";
-import { InventoryBatch, InventoryProduct, InventoryMovement } from "../../models/Inventory.js";
+import { InventoryBatch, InventoryProduct, InventoryMovement, Store } from "../../models/Inventory.js";
 import { Expense } from "../../models/Finance.js";
 import { verifyJWT, getHeaderToken } from "../../libs/jwt.js";
 import { notifyOk, notifyFail } from "../../services/notifyRaptorSolutions.js";
 import { onInventoryStockChanged } from "../../services/notificationService.js";
 import { nowApp } from "../../utils/appDateTime.js";
+import { getAppSettingsSync } from "../../services/appSettingsService.js";
+import {
+  adjustStoreStock,
+  getDefaultStockStoreId,
+  getStoreStockQty,
+  storeHoldsInventory,
+} from "../../services/storeStockService.js";
+import {
+  ensureBatchStoreIdColumn,
+  closeBatchManual,
+  splitBatchToStore,
+} from "../../services/batchStockService.js";
 
 let schemaReady = false;
 
@@ -36,6 +48,7 @@ export async function ensureInventoryBatchesSchema() {
   } catch (e) {
     console.warn("ensureInventoryBatchesSchema manufacturedAt:", e?.message || e);
   }
+  await ensureBatchStoreIdColumn();
   schemaReady = true;
 }
 
@@ -89,6 +102,7 @@ function shapeBatch(row, warnDays = 30) {
   const plain = typeof row.toJSON === "function" ? row.toJSON() : row;
   const flags = alertFlags(plain, warnDays);
   const product = plain.product || plain.ERP_inventory_product || null;
+  const store = plain.store || plain.ERP_store || null;
   const manufacturedAt = plain.manufacturedAt
     ? String(plain.manufacturedAt).slice(0, 10)
     : null;
@@ -98,6 +112,8 @@ function shapeBatch(row, warnDays = 30) {
     productId: plain.productId,
     productName: product?.name || `(producto #${plain.productId})`,
     productType: product?.type || null,
+    storeId: plain.storeId ?? null,
+    storeName: store?.name || null,
     code: plain.code || null,
     quantityInitial: round4(plain.quantityInitial),
     quantityRemaining: round4(plain.quantityRemaining),
@@ -201,6 +217,12 @@ export const getBatches = async (req, res) => {
           as: "product",
           attributes: ["id", "name", "type", "stock", "unitId"],
         },
+        {
+          model: Store,
+          as: "store",
+          attributes: ["id", "name", "locationKind"],
+          required: false,
+        },
       ],
       order: [
         ["expiresAt", "ASC"],
@@ -243,10 +265,22 @@ export const createBatch = async (req, res) => {
       ? toNum(req.body.unitCost)
       : null;
     const createExpense = Boolean(req.body?.createExpense);
+    /** assign = solo fechas sobre stock ya existente; add = suma stock (entrada). */
+    const stockModeRaw = String(req.body?.stockMode || req.body?.mode || "add")
+      .trim()
+      .toLowerCase();
+    const stockMode = stockModeRaw === "assign" || stockModeRaw === "existing"
+      ? "assign"
+      : "add";
     const receivedAtRaw = req.body?.receivedAt;
     const receivedAt = receivedAtRaw
       ? new Date(receivedAtRaw)
       : nowApp();
+    const multi = Boolean(getAppSettingsSync()?.multiStockEnabled);
+    let resolvedStoreId =
+      req.body?.storeId != null && req.body.storeId !== ""
+        ? Number(req.body.storeId)
+        : null;
 
     if (!Number.isFinite(productId) || productId < 1) {
       notifyFail("batch.create_failed", "Producto inválido", { req, httpStatus: 400 });
@@ -280,9 +314,24 @@ export const createBatch = async (req, res) => {
         throw err;
       }
 
+      if (multi) {
+        if (!Number.isFinite(resolvedStoreId) || resolvedStoreId <= 0) {
+          resolvedStoreId = await getDefaultStockStoreId({ transaction: t });
+        }
+        const store = await Store.findByPk(resolvedStoreId, { transaction: t });
+        if (!store || !storeHoldsInventory(store.locationKind)) {
+          const err = new Error("Indicá Bodega o sucursal propia para el lote.");
+          err.statusCode = 400;
+          throw err;
+        }
+      } else {
+        resolvedStoreId = null;
+      }
+
       const batch = await InventoryBatch.create(
         {
           productId,
+          storeId: resolvedStoreId,
           code,
           quantityInitial: round4(quantity),
           quantityRemaining: round4(quantity),
@@ -296,53 +345,80 @@ export const createBatch = async (req, res) => {
         { transaction: t },
       );
 
-      product.stock = round4(toNum(product.stock) + quantity);
-      await product.save({ transaction: t });
+      if (stockMode === "assign") {
+        // Solo registra el lote sobre stock que ya existe. No suma ni crea entrada de compra.
+        let available = toNum(product.stock);
+        if (resolvedStoreId) {
+          available = await getStoreStockQty(resolvedStoreId, productId, { transaction: t });
+        }
+        if (quantity > available + 1e-9) {
+          const err = new Error(
+            `No hay suficiente stock sin lote para asignar. Disponible: ${available}, pedido: ${quantity}.`,
+          );
+          err.statusCode = 400;
+          throw err;
+        }
+      } else {
+        if (resolvedStoreId) {
+          await adjustStoreStock(resolvedStoreId, productId, quantity, {
+            transaction: t,
+            allowNegative: false,
+          });
+        } else {
+          product.stock = round4(toNum(product.stock) + quantity);
+          await product.save({ transaction: t });
+        }
 
-      const priceTotal =
-        unitCost != null && unitCost >= 0 ? round4(unitCost * quantity) : null;
+        const priceTotal =
+          unitCost != null && unitCost >= 0 ? round4(unitCost * quantity) : null;
 
-      await InventoryMovement.create(
-        {
-          productId,
-          quantity,
-          type: "entrada",
-          reason: createExpense && priceTotal != null ? "ENTRADA_COMPRA" : "ENTRADA_OTRA",
-          description: code
-            ? `Entrada lote ${code} (vence ${expiresAt})`
-            : `Entrada lote #${batch.id} (vence ${expiresAt})`,
-          price: priceTotal,
-          referenceType: "inventory_batch",
-          referenceId: batch.id,
-          createdBy: user?.accountId ?? null,
-          date: Number.isNaN(receivedAt.getTime()) ? nowApp() : receivedAt,
-        },
-        { transaction: t },
-      );
-
-      if (createExpense && priceTotal != null && priceTotal > 0) {
-        await Expense.create(
+        await InventoryMovement.create(
           {
-            date: Number.isNaN(receivedAt.getTime()) ? nowApp() : receivedAt,
-            amount: priceTotal,
-            concept: `Compra lote ${code || `#${batch.id}`} — ${product.name}`,
-            category: "Compras",
-            referenceId: product.id,
-            referenceType: "inventory_entry",
+            productId,
+            quantity,
+            type: "entrada",
+            reason: createExpense && priceTotal != null ? "ENTRADA_COMPRA" : "ENTRADA_OTRA",
+            description: code
+              ? `Entrada lote ${code} (vence ${expiresAt})`
+              : `Entrada lote #${batch.id} (vence ${expiresAt})`,
+            price: priceTotal,
+            referenceType: "inventory_batch",
+            referenceId: batch.id,
             createdBy: user?.accountId ?? null,
+            date: Number.isNaN(receivedAt.getTime()) ? nowApp() : receivedAt,
           },
           { transaction: t },
         );
+
+        if (createExpense && priceTotal != null && priceTotal > 0) {
+          await Expense.create(
+            {
+              date: Number.isNaN(receivedAt.getTime()) ? nowApp() : receivedAt,
+              amount: priceTotal,
+              concept: `Compra lote ${code || `#${batch.id}`} — ${product.name}`,
+              category: "Compras",
+              referenceId: product.id,
+              referenceType: "inventory_entry",
+              createdBy: user?.accountId ?? null,
+            },
+            { transaction: t },
+          );
+        }
       }
 
-      return { batch, product };
+      return { batch, product, stockMode };
     });
 
-    onInventoryStockChanged(productId).catch(() => {});
+    if (result.stockMode !== "assign") {
+      onInventoryStockChanged(productId).catch(() => {});
+    }
 
     const shaped = shapeBatch(
       await InventoryBatch.findByPk(result.batch.id, {
-        include: [{ model: InventoryProduct, as: "product", attributes: ["id", "name", "type", "stock"] }],
+        include: [
+          { model: InventoryProduct, as: "product", attributes: ["id", "name", "type", "stock"] },
+          { model: Store, as: "store", attributes: ["id", "name", "locationKind"], required: false },
+        ],
       }),
     );
 
@@ -362,7 +438,8 @@ export const createBatch = async (req, res) => {
 
 /**
  * PUT /inventory/batches/:id
- * Solo metadatos: code, expiresAt, manufacturedAt, notes (no cantidad).
+ * Metadatos + cantidad restante del lote (no borra el producto).
+ * Ajustar quantityRemaining NO mueve el stock del producto (ya se controla aparte / ventas).
  */
 export const updateBatch = async (req, res) => {
   try {
@@ -398,6 +475,35 @@ export const updateBatch = async (req, res) => {
       }
     }
 
+    if (req.body?.quantityRemaining !== undefined && req.body?.quantityRemaining !== "") {
+      const nextQty = round4(req.body.quantityRemaining);
+      if (!Number.isFinite(nextQty) || nextQty < 0) {
+        return res.status(400).json({ message: "Cantidad inválida" });
+      }
+      batch.quantityRemaining = nextQty;
+      const initial = round4(batch.quantityInitial);
+      if (nextQty > initial) {
+        batch.quantityInitial = nextQty;
+      }
+      batch.status = nextQty <= 0.0001 ? "depleted" : "active";
+    }
+
+    if (req.body?.storeId !== undefined) {
+      if (req.body.storeId === null || req.body.storeId === "") {
+        batch.storeId = null;
+      } else {
+        const sid = Number(req.body.storeId);
+        if (!Number.isFinite(sid) || sid <= 0) {
+          return res.status(400).json({ message: "Local inválido" });
+        }
+        const store = await Store.findByPk(sid);
+        if (!store || !storeHoldsInventory(store.locationKind)) {
+          return res.status(400).json({ message: "El local debe ser Bodega o sucursal propia." });
+        }
+        batch.storeId = sid;
+      }
+    }
+
     const nextExpires = String(batch.expiresAt || "").slice(0, 10);
     const nextMfg = batch.manufacturedAt
       ? String(batch.manufacturedAt).slice(0, 10)
@@ -411,7 +517,10 @@ export const updateBatch = async (req, res) => {
     await batch.save();
     const shaped = shapeBatch(
       await InventoryBatch.findByPk(id, {
-        include: [{ model: InventoryProduct, as: "product", attributes: ["id", "name", "type", "stock"] }],
+        include: [
+          { model: InventoryProduct, as: "product", attributes: ["id", "name", "type", "stock"] },
+          { model: Store, as: "store", attributes: ["id", "name", "locationKind"], required: false },
+        ],
       }),
     );
     notifyOk("batch.updated", `Lote #${id} actualizado`, { batch: shaped });
@@ -420,6 +529,80 @@ export const updateBatch = async (req, res) => {
     console.error("updateBatch:", error);
     notifyFail("batch.update_failed", "Error al actualizar lote", { error, req, httpStatus: 500 });
     return res.status(500).json({ message: "Error al actualizar lote" });
+  }
+};
+
+/**
+ * POST /inventory/batches/:id/close
+ * Cierra el lote (agotado) sin tocar stock del producto.
+ */
+export const closeBatch = async (req, res) => {
+  try {
+    await ensureInventoryBatchesSchema();
+    const id = Number(req.params.id);
+    const batch = await closeBatchManual(id);
+    const shaped = shapeBatch(
+      await InventoryBatch.findByPk(batch.id, {
+        include: [
+          { model: InventoryProduct, as: "product", attributes: ["id", "name", "type", "stock"] },
+          { model: Store, as: "store", attributes: ["id", "name"], required: false },
+        ],
+      }),
+    );
+    notifyOk("batch.closed", `Lote #${id} cerrado`, { batch: shaped });
+    return res.json(shaped);
+  } catch (error) {
+    const status = error?.statusCode || 500;
+    console.error("closeBatch:", error);
+    notifyFail("batch.close_failed", error.message || "Error al cerrar lote", {
+      error,
+      req,
+      httpStatus: status,
+    });
+    return res.status(status).json({ message: error.message || "Error al cerrar lote" });
+  }
+};
+
+/**
+ * POST /inventory/batches/:id/split
+ * body: { toStoreId, quantity } — divide lote y traslada stock (solo multistock).
+ */
+export const splitBatch = async (req, res) => {
+  try {
+    await ensureInventoryBatchesSchema();
+    const id = Number(req.params.id);
+    const toStoreId = Number(req.body?.toStoreId);
+    const quantity = req.body?.quantity;
+
+    const { source, created } = await splitBatchToStore({
+      batchId: id,
+      toStoreId,
+      quantity,
+    });
+
+    onInventoryStockChanged(source.productId).catch(() => {});
+
+    const include = [
+      { model: InventoryProduct, as: "product", attributes: ["id", "name", "type", "stock"] },
+      { model: Store, as: "store", attributes: ["id", "name", "locationKind"], required: false },
+    ];
+    const sourceShaped = shapeBatch(await InventoryBatch.findByPk(source.id, { include }));
+    const createdShaped = shapeBatch(await InventoryBatch.findByPk(created.id, { include }));
+
+    notifyOk("batch.split", `Lote #${id} dividido → #${created.id}`, {
+      source: sourceShaped,
+      created: createdShaped,
+    });
+    return res.json({ source: sourceShaped, created: createdShaped });
+  } catch (error) {
+    const status = error?.statusCode || 500;
+    console.error("splitBatch:", error);
+    notifyFail("batch.split_failed", error.message || "Error al dividir lote", {
+      error,
+      req,
+      httpStatus: status,
+    });
+    return res.status(status).json({ message: error.message || "Error al dividir lote" });
   }
 };
 
@@ -510,8 +693,7 @@ export const writeOffBatch = async (req, res) => {
 
 /**
  * DELETE /inventory/batches/:id
- * Solo si está agotado (historial accidental) o remaining=0.
- * Si aún tiene stock, rechaza (usar write-off).
+ * Elimina solo el registro del lote (fechas/cantidad). No borra el producto ni toca su stock.
  */
 export const deleteBatch = async (req, res) => {
   try {
@@ -520,14 +702,8 @@ export const deleteBatch = async (req, res) => {
     const batch = await InventoryBatch.findByPk(id);
     if (!batch) return res.status(404).json({ message: "Lote no encontrado" });
 
-    if (toNum(batch.quantityRemaining) > 0.0001) {
-      return res.status(400).json({
-        message: "No se puede eliminar un lote con stock. Usá «Baja por caducidad» o consumilo primero.",
-      });
-    }
-
     await batch.destroy();
-    notifyOk("batch.deleted", `Lote #${id} eliminado del historial`, { batchId: id });
+    notifyOk("batch.deleted", `Lote #${id} eliminado`, { batchId: id });
     return res.json({ message: "Lote eliminado", id });
   } catch (error) {
     console.error("deleteBatch:", error);

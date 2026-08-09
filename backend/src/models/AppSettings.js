@@ -57,7 +57,41 @@ export const AppSettings = sequelize.define(
       allowNull: false,
       defaultValue: false,
     },
+    /**
+     * Stock por local (bodega / sucursales).
+     * Store arranca en stock general; multistock se activa por config.
+     */
     multiStockEnabled: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    /** En selects de producto: mostrar chip de costo (precio proveedor del catálogo). */
+    showProductCostInSelect: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    /**
+     * Decimales a mostrar en pantalla para montos (0–6).
+     * En BD se guardan hasta 6; esto solo afecta visualización.
+     */
+    moneyDisplayDecimals: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 2,
+    },
+    /** Redondeo al mostrar: up | down | nearest */
+    moneyRoundingMode: {
+      type: DataTypes.STRING(16),
+      allowNull: false,
+      defaultValue: "up",
+    },
+    /**
+     * Pedidos: si al entregar falta stock, Admin/Programador puede ajustar
+     * (movimiento tipo ajuste) y completar la entrega.
+     */
+    ordersAllowDeliverStockAdjust: {
       type: DataTypes.BOOLEAN,
       allowNull: false,
       defaultValue: false,

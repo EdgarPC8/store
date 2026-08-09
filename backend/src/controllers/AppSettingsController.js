@@ -56,6 +56,10 @@ export async function putAppSettings(req, res) {
       "showPublicStoresPropia",
       "showPublicStoresVitrina",
       "multiStockEnabled",
+      "showProductCostInSelect",
+      "moneyDisplayDecimals",
+      "moneyRoundingMode",
+      "ordersAllowDeliverStockAdjust",
     ];
     const patch = {};
     for (const key of allowed) {
