@@ -27,23 +27,107 @@ function formatDateEc(d) {
   return `${dd}/${mm}/${yyyy}`;
 }
 
-function extractItems(invoice) {
-  const payload = invoice?.payloadJson || {};
-  const raw = Array.isArray(payload.items) ? payload.items : [];
-  return raw.map((it, idx) => {
-    const qty = Number(it.qty) || 0;
-    const unit = Number(it.unitPriceXml ?? it.unitPrice) || 0;
-    const lineBase =
-      it.lineBase != null ? Number(it.lineBase) : Number((qty * unit).toFixed(2));
+function tagText(xml, tag) {
+  const m = String(xml || "").match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "i"));
+  return m ? String(m[1]).replace(/<!\[CDATA\[|\]\]>/g, "").trim() : "";
+}
+
+function parseItemsFromXml(xml) {
+  const block = String(xml || "").match(/<detalles>([\s\S]*?)<\/detalles>/i);
+  if (!block) return [];
+  const chunks = block[1].match(/<detalle>[\s\S]*?<\/detalle>/gi) || [];
+  return chunks.map((chunk, idx) => {
+    const qty = Number(tagText(chunk, "cantidad")) || 0;
+    const unit = Number(tagText(chunk, "precioUnitario")) || 0;
+    const lineBase = Number(tagText(chunk, "precioTotalSinImpuesto")) || Number((qty * unit).toFixed(2));
+    const taxRate = Number(tagText(chunk, "tarifa")) || 0;
     return {
-      code: String(it.code || `ITEM${idx + 1}`).slice(0, 20),
-      description: String(it.description || "Ítem").slice(0, 80),
+      code: String(tagText(chunk, "codigoPrincipal") || `ITEM${idx + 1}`).slice(0, 20),
+      description: String(tagText(chunk, "descripcion") || "Ítem").slice(0, 80),
       qty,
       unit,
       lineBase,
-      taxRate: Number(it.taxRate) || 0,
+      taxRate,
     };
   });
+}
+
+async function readInvoiceXmlText(invoice) {
+  const rel = invoice?.xmlRelativePath;
+  if (!rel) return "";
+  const base = path.basename(String(rel));
+  const candidates = [
+    path.resolve(SRI_PRIVATE_DIR, "invoices", base),
+    path.resolve(SRI_PRIVATE_DIR, base),
+  ];
+  for (const full of candidates) {
+    try {
+      return await fsp.readFile(full, "utf8");
+    } catch {
+      /* next */
+    }
+  }
+  return "";
+}
+
+function normalizePayload(invoice) {
+  const j =
+    invoice && typeof invoice.toJSON === "function" ? invoice.toJSON() : { ...(invoice || {}) };
+  let payload = j.payloadJson ?? j.payload ?? null;
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      payload = {};
+    }
+  }
+  if (!payload || typeof payload !== "object") payload = {};
+  return { plain: j, payload };
+}
+
+function mapRawItems(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((it, idx) => {
+      if (!it || typeof it !== "object") return null;
+      const qty = Number(it.qty ?? it.quantity ?? it.cantidad) || 0;
+      if (!(qty > 0) && !it.description && !it.descripcion && !it.name) return null;
+      const unit = Number(it.unitPriceXml ?? it.unitPrice ?? it.precioUnitario ?? it.price) || 0;
+      const lineBase =
+        it.lineBase != null
+          ? Number(it.lineBase)
+          : it.precioTotalSinImpuesto != null
+            ? Number(it.precioTotalSinImpuesto)
+            : Number((qty * unit).toFixed(2));
+      return {
+        code: String(it.code || it.codigoPrincipal || it.productId || `ITEM${idx + 1}`).slice(
+          0,
+          20,
+        ),
+        description: String(
+          it.description || it.descripcion || it.name || it.productName || "Ítem",
+        ).slice(0, 80),
+        qty: qty || 1,
+        unit,
+        lineBase,
+        taxRate: Number(it.taxRate ?? it.tarifa ?? it.ivaRate) || 0,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function extractItems(invoice) {
+  const { payload } = normalizePayload(invoice);
+  const fromPayload = mapRawItems(
+    payload.items || payload.lines || payload.detalles || payload.products,
+  );
+  if (fromPayload.length) return fromPayload;
+
+  const xml = await readInvoiceXmlText(invoice);
+  const fromXml = parseItemsFromXml(xml);
+  if (fromXml.length) return fromXml;
+
+  return [];
 }
 
 /**
@@ -62,7 +146,7 @@ export async function generateAndStoreInvoicePdf(invoice, settings, logoAbsolute
 
   const legal = settings.legalName || settings.tradeName || "Emisor";
   const trade = settings.tradeName || legal;
-  const items = extractItems(invoice);
+  const items = await extractItems(invoice);
   const issueDate = formatDateEc(invoice.authorizedAt || invoice.createdAt);
 
   await new Promise((resolve, reject) => {

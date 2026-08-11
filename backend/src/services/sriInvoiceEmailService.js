@@ -13,6 +13,7 @@ import {
   loadSriBillingSettings,
   getInvoiceEmailQuotaPublic,
   ensureSriEmailSchema,
+  ensureSriPrivateDir,
 } from "./sriBillingService.js";
 import { loadAppSettings } from "./appSettingsService.js";
 import {
@@ -25,6 +26,8 @@ import {
   generateSampleInvoicePdf,
   unlinkQuiet,
 } from "./sriInvoiceRidePdf.js";
+import { ElectronicInvoice } from "../models/SriBilling.js";
+import { sequelize } from "../database/connection.js";
 
 const { __dirname } = fileDirName(import.meta);
 const IMG_BASE = path.resolve(__dirname, "../img");
@@ -140,23 +143,38 @@ async function resolveXmlAttachment(invoice) {
   return null;
 }
 
-async function resolveOrCreatePdfAttachment(invoice, settings, logoPath) {
-  const existingRel = invoice.ridePdfRelativePath;
-  if (existingRel) {
-    const full = path.resolve(SRI_PRIVATE_DIR, existingRel);
+async function resolveOrCreatePdfAttachment(invoice, settings, logoPath, uploadedPdf) {
+  // Preferir PDF RIDE subido desde el frontend (mismo de “Descargar”)
+  if (uploadedPdf?.buffer?.length) {
     try {
-      await fsp.access(full);
+      ensureSriPrivateDir();
+      const invoicesDir = path.join(SRI_PRIVATE_DIR, "invoices");
+      fs.mkdirSync(invoicesDir, { recursive: true });
+      const key = String(invoice.accessKey || invoice.id || Date.now()).replace(/\W/g, "");
+      const filename = `${key || `factura-${invoiceNumberLabel(invoice)}`}-ride.pdf`;
+      const absolutePath = path.join(invoicesDir, filename);
+      await fsp.writeFile(absolutePath, uploadedPdf.buffer);
+      const relativePath = `invoices/${filename}`;
+      if (invoice?.update && typeof invoice.update === "function") {
+        try {
+          await invoice.update({ ridePdfRelativePath: relativePath });
+        } catch (e) {
+          console.warn("No se pudo guardar ridePdfRelativePath:", e?.message || e);
+        }
+      }
       return {
         filename: `factura-${invoiceNumberLabel(invoice)}.pdf`,
-        path: full,
+        path: absolutePath,
         contentType: "application/pdf",
-        created: false,
+        created: true,
+        source: "ride",
       };
-    } catch {
-      /* regenerate */
+    } catch (e) {
+      console.error("guardar PDF RIDE:", e?.message || e);
     }
   }
 
+  // Fallback: PDF generado en servidor
   try {
     const pdf = await generateAndStoreInvoicePdf(invoice, settings, logoPath);
     if (invoice?.update && typeof invoice.update === "function") {
@@ -171,6 +189,7 @@ async function resolveOrCreatePdfAttachment(invoice, settings, logoPath) {
       path: pdf.absolutePath,
       contentType: "application/pdf",
       created: true,
+      source: "server",
     };
   } catch (e) {
     console.error("generateAndStoreInvoicePdf:", e?.message || e);
@@ -188,10 +207,13 @@ async function decryptSmtpPassword(settings) {
 
 /**
  * Envía factura autorizada al correo del cliente si la config lo permite.
+ * @param {object} invoice
+ * @param {{ pdfFile?: { buffer: Buffer, originalname?: string } }} [opts]
  */
-export async function maybeSendAuthorizedInvoiceEmail(invoice) {
+export async function maybeSendAuthorizedInvoiceEmail(invoice, opts = {}) {
   try {
     await ensureSriEmailSchema();
+    await ensureInvoiceEmailSentSchema();
     const settings = await loadSriBillingSettings();
     const quota = getInvoiceEmailQuotaPublic(settings);
 
@@ -224,6 +246,15 @@ export async function maybeSendAuthorizedInvoiceEmail(invoice) {
       };
     }
 
+    if (invoice.invoiceEmailSentAt && !opts.force) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: "Esta factura ya fue enviada por correo.",
+        alreadySent: true,
+      };
+    }
+
     const password = await decryptSmtpPassword(settings);
     if (!password) {
       return { ok: false, skipped: true, reason: "Contraseña SMTP vacía." };
@@ -233,7 +264,12 @@ export async function maybeSendAuthorizedInvoiceEmail(invoice) {
     const from = String(settings.smtpFrom || settings.smtpUser || "").trim();
     const transport = buildTransport(settings, password);
     const xmlAtt = await resolveXmlAttachment(invoice);
-    const pdfAtt = await resolveOrCreatePdfAttachment(invoice, settings, logoPath);
+    const pdfAtt = await resolveOrCreatePdfAttachment(
+      invoice,
+      settings,
+      logoPath,
+      opts.pdfFile || null,
+    );
     const logoAtt = logoCidAttachment(logoPath);
     const num = invoiceNumberLabel(invoice);
 
@@ -258,12 +294,19 @@ export async function maybeSendAuthorizedInvoiceEmail(invoice) {
       attachments,
     });
 
+    try {
+      await invoice.update({ invoiceEmailSentAt: new Date() });
+    } catch (e) {
+      console.warn("invoiceEmailSentAt:", e?.message || e);
+    }
+
     await bumpEmailSentCount(settings);
     const after = getInvoiceEmailQuotaPublic(await settings.reload());
     return {
       ok: true,
       skipped: false,
       to,
+      pdfSource: pdfAtt?.source || null,
       warning: after.invoiceEmailWarning,
       usage: {
         sentToday: after.invoiceEmailsSentToday,
@@ -279,6 +322,53 @@ export async function maybeSendAuthorizedInvoiceEmail(invoice) {
       reason: e?.message || "Error al enviar el correo de la factura.",
     };
   }
+}
+
+let invoiceEmailSentSchemaReady = false;
+async function ensureInvoiceEmailSentSchema() {
+  if (invoiceEmailSentSchemaReady) return;
+  try {
+    const [found] = await sequelize.query(
+      `SHOW COLUMNS FROM \`electronic_invoices\` LIKE 'invoiceEmailSentAt'`,
+    );
+    if (!Array.isArray(found) || found.length === 0) {
+      await sequelize.query(
+        `ALTER TABLE \`electronic_invoices\` ADD COLUMN \`invoiceEmailSentAt\` DATETIME NULL`,
+      );
+    }
+  } catch (e) {
+    console.warn("ensureInvoiceEmailSentSchema:", e?.message || e);
+  }
+  invoiceEmailSentSchemaReady = true;
+}
+
+/** Endpoint: envía correo con PDF RIDE opcional (multipart). */
+export async function sendCustomerInvoiceEmailById(invoiceId, pdfFile, { force = false } = {}) {
+  await ensureInvoiceEmailSentSchema();
+  const invoice = await ElectronicInvoice.findByPk(Number(invoiceId));
+  if (!invoice) {
+    const err = new Error("Factura no encontrada");
+    err.status = 404;
+    throw err;
+  }
+  if (String(invoice.status || "").toLowerCase() !== "authorized") {
+    const err = new Error("La factura aún no está autorizada por el SRI");
+    err.status = 400;
+    throw err;
+  }
+  const result = await maybeSendAuthorizedInvoiceEmail(invoice, { pdfFile, force });
+  if (!result.ok && !result.skipped) {
+    const err = new Error(result.reason || "No se pudo enviar el correo");
+    err.status = 500;
+    throw err;
+  }
+  if (!result.ok && result.skipped && result.limitReached) {
+    const err = new Error(result.reason);
+    err.status = 429;
+    err.warning = result.warning;
+    throw err;
+  }
+  return result;
 }
 
 /** Prueba SMTP con la misma plantilla visual + PDF de muestra. */
