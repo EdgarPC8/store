@@ -49,7 +49,7 @@ export const DEFAULT_APP_SETTINGS = {
   showProductCostInSelect: false,
   moneyDisplayDecimals: 2,
   moneyRoundingMode: "up",
-  ordersAllowDeliverStockAdjust: false,
+  ordersAllowDeliverStockAdjust: true,
   receiptDetailSettings: { ...DEFAULT_RECEIPT_DETAIL_SETTINGS },
   themePalette: normalizeThemePalette(DEFAULT_THEME_PALETTE),
 };
@@ -195,7 +195,7 @@ async function ensureAppSettingsSchema() {
     ["showPublicStoresVitrina", false],
     ["multiStockEnabled", false],
     ["showProductCostInSelect", false],
-    ["ordersAllowDeliverStockAdjust", false],
+    ["ordersAllowDeliverStockAdjust", true],
   ];
   for (const [col, def] of boolCols) {
     if (!table[col]) {
@@ -303,7 +303,7 @@ export async function loadAppSettings() {
     showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, false),
     multiStockEnabled: asBool(raw.multiStockEnabled, false),
     showProductCostInSelect: asBool(raw.showProductCostInSelect, false),
-    ordersAllowDeliverStockAdjust: asBool(raw.ordersAllowDeliverStockAdjust, false),
+    ordersAllowDeliverStockAdjust: asBool(raw.ordersAllowDeliverStockAdjust, true),
     moneyDisplayDecimals: normalizeMoneyDisplayDecimals(raw.moneyDisplayDecimals, 2),
     moneyRoundingMode: normalizeMoneyRoundingMode(raw.moneyRoundingMode, "up"),
     receiptDetailSettings: normalizeReceiptDetailSettings(raw.receiptDetailSettings),
@@ -329,7 +329,7 @@ export async function updateAppSettings(payload) {
   if ("ordersAllowDeliverStockAdjust" in patch) {
     patch.ordersAllowDeliverStockAdjust = asBool(
       patch.ordersAllowDeliverStockAdjust,
-      false,
+      true,
     );
   }
   if ("moneyDisplayDecimals" in patch) {
@@ -367,7 +367,7 @@ export async function updateAppSettings(payload) {
     showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, false),
     multiStockEnabled: asBool(raw.multiStockEnabled, false),
     showProductCostInSelect: asBool(raw.showProductCostInSelect, false),
-    ordersAllowDeliverStockAdjust: asBool(raw.ordersAllowDeliverStockAdjust, false),
+    ordersAllowDeliverStockAdjust: asBool(raw.ordersAllowDeliverStockAdjust, true),
     moneyDisplayDecimals: normalizeMoneyDisplayDecimals(raw.moneyDisplayDecimals, 2),
     moneyRoundingMode: normalizeMoneyRoundingMode(raw.moneyRoundingMode, "up"),
     receiptDetailSettings: normalizeReceiptDetailSettings(raw.receiptDetailSettings),
@@ -405,7 +405,7 @@ export function toPublicSettings(data = cache) {
     showPublicStoresVitrina: asBool(data.showPublicStoresVitrina, false),
     multiStockEnabled: asBool(data.multiStockEnabled, false),
     showProductCostInSelect: asBool(data.showProductCostInSelect, false),
-    ordersAllowDeliverStockAdjust: asBool(data.ordersAllowDeliverStockAdjust, false),
+    ordersAllowDeliverStockAdjust: asBool(data.ordersAllowDeliverStockAdjust, true),
     moneyDisplayDecimals: normalizeMoneyDisplayDecimals(data.moneyDisplayDecimals, 2),
     moneyRoundingMode: normalizeMoneyRoundingMode(data.moneyRoundingMode, "up"),
     receiptDetailSettings: normalizeReceiptDetailSettings(data.receiptDetailSettings),
