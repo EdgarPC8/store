@@ -34,6 +34,12 @@ rsync -a \
   --exclude 'src/backups/' \
   "$SRC/" "$DST/"
 
+# Store usa bcryptjs; Eddeli usa bcrypt nativo — unificar tras sync.
+find "$DST/src" "$DST/scripts" -type f \( -name '*.js' -o -name '*.mjs' \) \
+  -exec grep -l "from [\"']bcrypt[\"']" {} \; 2>/dev/null | while read -r f; do
+  sed -i 's/from "bcrypt"/from "bcryptjs"/g; s/from '\''bcrypt'\''/from '\''bcryptjs'\''/g' "$f"
+done
+
 if [[ -f "$DST/src/routes/SubscriptionRoutes.js" ]]; then
   sed -i 's/frontend EdDeli/frontend Store/g' \
     "$DST/src/routes/SubscriptionRoutes.js" 2>/dev/null || true
@@ -70,4 +76,4 @@ elif "next.multiStockEnabled = false;" not in text:
 PY
 fi
 
-echo "✅ Sync eddeli → store (sin tocar identidad Store / AppSettings Raptor / seed / multiStock OFF)."
+echo "✅ Sync eddeli → store (identidad Store + bcryptjs + multiStock OFF)."
