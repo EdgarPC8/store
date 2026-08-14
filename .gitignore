@@ -7,6 +7,8 @@ backend/node_modules/
 .env.*.local
 !.env.example
 backend/.env
+backend/.env.*
+!backend/.env.example
 
 # El frontend de desarrollo es el de eddeli/frontend (npm run store).
 # Compilación de producción: copiá el build fuera o a un docroot /store/.
@@ -31,4 +33,5 @@ backend/src/img/products/
 # Sistema
 .DS_Store
 *.log
+*.bak
 node_modules/

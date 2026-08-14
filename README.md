@@ -51,6 +51,44 @@ Eso **no** pisa identidad Store (`.env`, puerto, `storeapi`, BD, `seed.js`, AppS
 
 ## Entitlement (gestor Raptor)
 
-`PUT /storeapi/subscription/entitlement` con `GESTOR_SYNC_SECRET` (= `Apps.entitlement_secret` en el gestor).
+Store usa el mismo mecanismo que Tienda y EdDeli. El gestor empuja a:
+
+```text
+PUT /storeapi/subscription/entitlement
+```
+
+`GESTOR_SYNC_SECRET` debe coincidir con `Apps.entitlement_secret` de **Store**
+en el gestor. El pull opcional de la app apunta a
+`https://aplicaciones.marianosamaniego.edu.ec/raptorsolutions/api`.
 
 URL local típica: `http://127.0.0.1:3003/storeapi/subscription/entitlement`
+
+## Git y despliegue
+
+Desde el equipo de desarrollo, el siguiente comando compila el frontend de
+Store, copia el resultado a este repositorio y hace commit + push del deploy y
+del código compartido de Raptor:
+
+```bash
+cd AppsWeb/raptor/frontend
+npm run git-push-store -- "descripción del cambio"
+```
+
+Para subir los tres deploys de una sola vez:
+
+```bash
+npm run git-push-apps -- "cambio compartido"
+```
+
+En el servidor de Store:
+
+```bash
+cd /ruta/a/store
+git status
+git pull
+```
+
+Antes de `git pull`, el estado debe estar limpio. La configuración exclusiva
+del servidor pertenece en `backend/.env` (incluido `GESTOR_SYNC_SECRET`), que
+está ignorado por Git. No edites archivos versionados del backend directamente
+en el servidor.
