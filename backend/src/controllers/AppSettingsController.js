@@ -60,6 +60,7 @@ export async function putAppSettings(req, res) {
       "moneyDisplayDecimals",
       "moneyRoundingMode",
       "ordersAllowDeliverStockAdjust",
+      "financeAllowAdminCorrections",
       "suggestOpenPackOnPosShortage",
       "cajaAllowCreateProductFromSelect",
       "cajaAllowCreateProductFromScan",
@@ -102,7 +103,6 @@ export async function putAppSettings(req, res) {
 
       if (wantOn && !currentOn) {
         const gate = await getFeatureGate("multi_stock");
-        // Sin feature en entitlement (apps viejas / sin sync): permitir.
         if (gate.present) {
           const ok =
             gate.status === "active" ||
