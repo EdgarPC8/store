@@ -1,36 +1,40 @@
 /**
- * referenceId en ERP_finance_expenses es polimórfico (supplier_order_payment, etc.).
- * Una FK antigua a ERP_inventory_products rompe pagos a proveedores.
+ * referenceId en ERP_finance_expenses es polimórfico (supplier_order_abono, etc.).
+ * Cualquier FK a ERP_inventory_products rompe abonos y pagos a proveedores.
  *
- * Uso: node scripts/fix-expense-reference-fk.js
+ * Uso: npm run db:fix:expense-reference-fk
  */
 import "dotenv/config";
 import { sequelize } from "../src/database/connection.js";
 
 const TABLE = "ERP_finance_expenses";
+const REF_COLUMN = "referenceId";
+const BAD_REF_TABLE = "ERP_inventory_products";
 
-async function dropFkIfExists(constraintName) {
+async function listReferenceIdProductFks() {
   const [rows] = await sequelize.query(
     `SELECT CONSTRAINT_NAME
-     FROM information_schema.TABLE_CONSTRAINTS
+     FROM information_schema.KEY_COLUMN_USAGE
      WHERE TABLE_SCHEMA = DATABASE()
        AND TABLE_NAME = ?
-       AND CONSTRAINT_NAME = ?
-       AND CONSTRAINT_TYPE = 'FOREIGN KEY'`,
-    { replacements: [TABLE, constraintName] }
+       AND COLUMN_NAME = ?
+       AND REFERENCED_TABLE_NAME = ?
+       AND REFERENCED_COLUMN_NAME IS NOT NULL`,
+    { replacements: [TABLE, REF_COLUMN, BAD_REF_TABLE] }
   );
-  if (!rows.length) return false;
-  await sequelize.query(`ALTER TABLE \`${TABLE}\` DROP FOREIGN KEY \`${constraintName}\``);
-  return true;
+  return rows.map((r) => r.CONSTRAINT_NAME).filter(Boolean);
 }
 
 try {
   await sequelize.authenticate();
-  const dropped = await dropFkIfExists("ERP_finance_expenses_ibfk_7");
-  if (dropped) {
-    console.log("✅ FK ERP_finance_expenses_ibfk_7 eliminada (referenceId → producto).");
-  } else {
-    console.log("ℹ️  FK ERP_finance_expenses_ibfk_7 no existe; nada que hacer.");
+  const fks = await listReferenceIdProductFks();
+  if (!fks.length) {
+    console.log(`ℹ️  No hay FK de ${TABLE}.${REF_COLUMN} → ${BAD_REF_TABLE}.`);
+    process.exit(0);
+  }
+  for (const name of fks) {
+    await sequelize.query(`ALTER TABLE \`${TABLE}\` DROP FOREIGN KEY \`${name}\``);
+    console.log(`✅ FK eliminada: ${name}`);
   }
   process.exit(0);
 } catch (error) {
