@@ -322,7 +322,7 @@ export const posCheckout = async (req, res) => {
               productId: product.id,
               quantity: deficit,
               type: "entrada",
-              reason: "AJUSTE_AUTOCOMPLETADO",
+              reason: "AJUSTE_ENTRADA",
               referenceType: "order",
               referenceId: order.id,
               date: now,
