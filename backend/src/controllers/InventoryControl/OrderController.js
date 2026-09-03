@@ -304,9 +304,32 @@ export const posCheckout = async (req, res) => {
           );
         }
         const available = await getStoreStockQty(stockStoreId, productId, { transaction: t });
+        const autoFill = getAppSettingsSync()?.ordersAllowDeliverStockAdjust !== false;
         if (available < qty) {
-          throw new Error(
-            `Stock insuficiente en este local para ${product.name}. Disponible: ${available}`,
+          if (!autoFill) {
+            throw new Error(
+              `Stock insuficiente en este local para ${product.name}. Disponible: ${available}`,
+            );
+          }
+          // Autocompletar: rellenar el déficit antes de descontar
+          const deficit = qty - available;
+          await adjustStoreStock(stockStoreId, productId, deficit, {
+            transaction: t,
+            allowNegative: false,
+          });
+          await InventoryMovement.create(
+            {
+              productId: product.id,
+              quantity: deficit,
+              type: "entrada",
+              reason: "AJUSTE_AUTOCOMPLETADO",
+              referenceType: "order",
+              referenceId: order.id,
+              date: now,
+              createdBy: accountId,
+              description: `Autocompletar stock POS · ${product.name} · local #${stockStoreId}`,
+            },
+            { transaction: t },
           );
         }
         await adjustStoreStock(stockStoreId, productId, -qty, {
