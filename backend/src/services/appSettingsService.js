@@ -49,6 +49,7 @@ export const DEFAULT_APP_SETTINGS = {
   showPublicStoresPropia: true,
   showPublicStoresVitrina: true,
   multiStockEnabled: false,
+  principalStoreId: null,
   showProductCostInSelect: false,
   moneyDisplayDecimals: 2,
   moneyRoundingMode: "up",
@@ -71,6 +72,11 @@ export const DEFAULT_APP_SETTINGS = {
 };
 
 let cache = { ...DEFAULT_APP_SETTINGS };
+
+function asPrincipalStoreId(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
 
 export function getAppSettingsSync() {
   return cache;
@@ -244,6 +250,13 @@ async function ensureAppSettingsSchema() {
       allowNull: true,
     });
   }
+  if (!table.principalStoreId) {
+    await qi.addColumn("app_settings", "principalStoreId", {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      defaultValue: null,
+    });
+  }
 }
 
 /** Amplía columnas de precio a DECIMAL(14,6) si aún no lo son. */
@@ -314,6 +327,7 @@ export async function loadAppSettings() {
     showPublicStoresPropia: asBool(raw.showPublicStoresPropia, true),
     showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, true),
     multiStockEnabled: asBool(raw.multiStockEnabled, false),
+    principalStoreId: asPrincipalStoreId(raw.principalStoreId),
     showProductCostInSelect: asBool(raw.showProductCostInSelect, false),
     ordersAllowDeliverStockAdjust: asBool(raw.ordersAllowDeliverStockAdjust, true),
     financeAllowAdminCorrections: asBool(raw.financeAllowAdminCorrections, true),
@@ -350,6 +364,9 @@ export async function updateAppSettings(payload) {
   }
   if ("multiStockEnabled" in patch) {
     patch.multiStockEnabled = asBool(patch.multiStockEnabled, false);
+  }
+  if ("principalStoreId" in patch) {
+    patch.principalStoreId = asPrincipalStoreId(patch.principalStoreId);
   }
   if ("showProductCostInSelect" in patch) {
     patch.showProductCostInSelect = asBool(patch.showProductCostInSelect, false);
@@ -454,6 +471,7 @@ export async function updateAppSettings(payload) {
     showPublicStoresPropia: asBool(raw.showPublicStoresPropia, true),
     showPublicStoresVitrina: asBool(raw.showPublicStoresVitrina, true),
     multiStockEnabled: asBool(raw.multiStockEnabled, false),
+    principalStoreId: asPrincipalStoreId(raw.principalStoreId),
     showProductCostInSelect: asBool(raw.showProductCostInSelect, false),
     ordersAllowDeliverStockAdjust: asBool(raw.ordersAllowDeliverStockAdjust, true),
     financeAllowAdminCorrections: asBool(raw.financeAllowAdminCorrections, true),
@@ -506,6 +524,7 @@ export function toPublicSettings(data = cache) {
     showPublicStoresPropia: asBool(data.showPublicStoresPropia, true),
     showPublicStoresVitrina: asBool(data.showPublicStoresVitrina, true),
     multiStockEnabled: asBool(data.multiStockEnabled, false),
+    principalStoreId: asPrincipalStoreId(data.principalStoreId),
     showProductCostInSelect: asBool(data.showProductCostInSelect, false),
     ordersAllowDeliverStockAdjust: asBool(data.ordersAllowDeliverStockAdjust, true),
     financeAllowAdminCorrections: asBool(data.financeAllowAdminCorrections, true),
