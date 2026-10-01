@@ -1,1 +1,0 @@
-import{av as t,bo as a}from"./index-B3INT6z1.js";const r=()=>t.get("/notification-programs",a()),s=o=>t.post("/notification-programs",o,a()),c=(o,i)=>t.put(`/notification-programs/${o}`,i,a()),e=o=>t.delete(`/notification-programs/${o}`,a()),g=o=>t.post(`/notification-programs/${o}/send`,null,a());export{s as c,e as d,r as g,g as s,c as u};
