@@ -262,7 +262,13 @@ const orderIncludes = [
   {
     model: SupplierOrderItem,
     as: "ERP_supplier_order_items",
-    include: [{ model: InventoryProduct, as: "ERP_inventory_product" }],
+    include: [
+      {
+        model: InventoryProduct,
+        as: "ERP_inventory_product",
+        required: false,
+      },
+    ],
   },
 ];
 
@@ -864,6 +870,23 @@ export const markSupplierOrderReceived = async (req, res) => {
       });
       return res.status(400).json({ message: "El pedido ya fue marcado como recibido" });
     }
+    if (order.peerAcceptStatus === "pending_accept") {
+      notifyFail(
+        "supplier_order.mark_received_failed",
+        "Debés aceptar y enlazar los productos del pedido enlazado antes de recibirlo",
+        { req, httpStatus: 400 },
+      );
+      return res.status(400).json({
+        message:
+          "Este pedido llegó del sistema enlazado: aceptalo y enlazá los productos antes de marcarlo como recibido",
+      });
+    }
+    const unmapped = (order.ERP_supplier_order_items || []).filter((it) => !it.productId);
+    if (unmapped.length) {
+      return res.status(400).json({
+        message: `Hay ${unmapped.length} ítem(s) sin producto local. Enlazalos antes de recibir el pedido.`,
+      });
+    }
 
     const receivedAt = resolveSupplierOrderReceiveDate({
       receivedAt: req.body?.receivedAt,
@@ -1052,6 +1075,16 @@ export const markSupplierOrderPaid = async (req, res) => {
         httpStatus: 400,
       });
       return res.status(400).json({ message: "El pedido ya fue marcado como pagado" });
+    }
+    if (order.peerAcceptStatus === "pending_accept") {
+      notifyFail(
+        "supplier_order.mark_paid_failed",
+        "Debés aceptar y enlazar los productos del pedido enlazado antes de pagarlo",
+        { req, httpStatus: 400 },
+      );
+      return res.status(400).json({
+        message: "Este pedido llegó del sistema enlazado: aceptalo y enlazá los productos antes de pagarlo",
+      });
     }
 
     const instMap = await loadSupplierInstallmentsMap([order.id]);

@@ -90,6 +90,9 @@ import {
   createSupplier,
   updateSupplier,
   deleteSupplier,
+  getSupplierAccounts,
+  linkSupplierAccountHandler,
+  unlinkSupplierAccountHandler,
 } from '../controllers/InventoryControl/SupplierController.js';
 import { simulateFromIntermediate, simulateProductionController } from '../controllers/InventoryControl/ProductionManagerController.js';
 import { 
@@ -361,5 +364,10 @@ router.get('/value-summary', isAuthenticated, getInventoryValueSummary);
 
 
 
+
+
+router.get('/suppliers/:id/accounts', isAuthenticated, getSupplierAccounts);
+router.post('/suppliers/:id/accounts', isAuthenticated, linkSupplierAccountHandler);
+router.delete('/suppliers/:id/accounts/:accountId', isAuthenticated, unlinkSupplierAccountHandler);
 
 export default router;

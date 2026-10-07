@@ -65,7 +65,8 @@ import {
   notFoundMiddleware,
   scrubSqlResponses,
 } from "./src/middlewares/errorMiddleware.js";
-import { restrictEmployee, restrictProgrammer } from "./src/middlewares/employeeAccess.js";
+import { restrictEmployee, restrictProgrammer, restrictSupplier } from "./src/middlewares/employeeAccess.js";
+import { ensurePeerSyncSchema } from "./src/services/supplierPeerSyncService.js";
 import { PORT, API_PREFIX } from "./src/config/serverEnv.js";
 
 // ✅ __dirname en ES Modules
@@ -100,6 +101,7 @@ app.use(scrubSqlResponses);
 app.use(loggerMiddleware);
 app.use(restrictEmployee);
 app.use(restrictProgrammer);
+app.use(restrictSupplier);
 app.use(loadMetricsMiddleware);
 
 // CORS — localhost, LAN 192.168/10.x y dominio institucional (sin IPs fijas)
@@ -174,6 +176,7 @@ export async function main() {
     await loadAppSettings();
     await loadSriBillingSettings();
     // Sin sync({ alter }) en arranque: el esquema se alinea a mano con `npm run db:sync`.
+    await ensurePeerSyncSchema();
     await ensureEntitlementTable({ alter: false });
     await enforceEntitlementSideEffectsOnBoot();
     await loadAppSettings();

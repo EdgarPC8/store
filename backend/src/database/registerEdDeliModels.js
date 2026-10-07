@@ -27,3 +27,4 @@ import "../models/AppSettings.js";
 import "../models/SriBilling.js";
 import "../models/AppEntitlement.js";
 import "../models/AppNews.js";
+import "../models/SupplierAccount.js";
