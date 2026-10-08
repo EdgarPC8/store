@@ -376,13 +376,34 @@ function asBool(value, fallback = true) {
   return fallback;
 }
 
+/** Campos JSON del modelo son TEXT: serializar objetos antes de create/update. */
+function serializeJsonFieldsForDb(data) {
+  const out = { ...data };
+  if ("receiptDetailSettings" in out && out.receiptDetailSettings != null) {
+    out.receiptDetailSettings = serializeReceiptDetailSettings(out.receiptDetailSettings);
+  }
+  if ("tableColumnVisibility" in out && out.tableColumnVisibility != null) {
+    out.tableColumnVisibility = serializeTableColumnVisibility(out.tableColumnVisibility);
+  }
+  if ("themePalette" in out && out.themePalette != null) {
+    out.themePalette = serializeThemePalette(out.themePalette);
+  }
+  if ("keyboardShortcuts" in out && out.keyboardShortcuts != null) {
+    out.keyboardShortcuts = serializeKeyboardShortcuts(out.keyboardShortcuts);
+  }
+  return out;
+}
+
 export async function loadAppSettings() {
   await ensureAppSettingsSchema();
   await ensureInventoryProductMoneySchema();
   await AppSettings.sync();
   let row = await AppSettings.findByPk(1);
   if (!row) {
-    row = await AppSettings.create({ id: 1, ...DEFAULT_APP_SETTINGS });
+    row = await AppSettings.create({
+      id: 1,
+      ...serializeJsonFieldsForDb(DEFAULT_APP_SETTINGS),
+    });
   }
   row = await migrateSettingsRow(row);
   const raw = row.toJSON();
@@ -555,7 +576,10 @@ export async function updateAppSettings(payload) {
   }
   let row = await AppSettings.findByPk(1);
   if (!row) {
-    row = await AppSettings.create({ id: 1, ...DEFAULT_APP_SETTINGS, ...patch });
+    row = await AppSettings.create({
+      id: 1,
+      ...serializeJsonFieldsForDb({ ...DEFAULT_APP_SETTINGS, ...patch }),
+    });
   } else {
     await row.update(patch);
   }
