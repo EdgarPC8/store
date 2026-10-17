@@ -2,7 +2,3 @@ node_modules
 src/private/sri/*
 !src/private/sri/.gitkeep
 scripts/data/goupc-skip.json
-src/database/backup.json
-src/database/backup.json.bak*
-src/database/*.bak*
-src/backups/
