@@ -361,6 +361,18 @@ export const getSupplierOrders = async (req, res) => {
       if (toDate) where.date[Op.lte] = toDate;
     }
 
+    const token = getHeaderToken(req);
+    const user = token ? await verifyJWT(token).catch(() => null) : null;
+    const rol = String(user?.loginRol || "");
+    if (rol === "Proveedor" || rol === "Proovedor") {
+      const { getLinkedSupplierIdsForAccount } = await import(
+        "../../services/supplierAccountService.js"
+      );
+      const ids = await getLinkedSupplierIdsForAccount(user.accountId);
+      if (!ids.length) return res.json([]);
+      where.supplierId = { [Op.in]: ids };
+    }
+
     const rows = await SupplierOrder.findAll({
       where,
       include: orderIncludes,
@@ -1075,16 +1087,6 @@ export const markSupplierOrderPaid = async (req, res) => {
         httpStatus: 400,
       });
       return res.status(400).json({ message: "El pedido ya fue marcado como pagado" });
-    }
-    if (order.peerAcceptStatus === "pending_accept") {
-      notifyFail(
-        "supplier_order.mark_paid_failed",
-        "Debés aceptar y enlazar los productos del pedido enlazado antes de pagarlo",
-        { req, httpStatus: 400 },
-      );
-      return res.status(400).json({
-        message: "Este pedido llegó del sistema enlazado: aceptalo y enlazá los productos antes de pagarlo",
-      });
     }
 
     const instMap = await loadSupplierInstallmentsMap([order.id]);

@@ -74,7 +74,8 @@ import {
   deleteMovement,
   updateMovementsDateBatch,
   registerProductionIntermediateFromPayload,
-  registerProductionFinalFromPayload
+  registerProductionFinalFromPayload,
+  anularProduccion,
 } from '../controllers/InventoryControl/MovementController.js';
 
 
@@ -93,6 +94,7 @@ import {
   getSupplierAccounts,
   linkSupplierAccountHandler,
   unlinkSupplierAccountHandler,
+  generateSupplierPeerSecret,
 } from '../controllers/InventoryControl/SupplierController.js';
 import { simulateFromIntermediate, simulateProductionController } from '../controllers/InventoryControl/ProductionManagerController.js';
 import { 
@@ -265,6 +267,10 @@ router.get('/suppliers', isAuthenticated, getAllSuppliers);
 router.post('/suppliers', isAuthenticated, createSupplier);
 router.put('/suppliers/:id', isAuthenticated, updateSupplier);
 router.delete('/suppliers/:id', isAuthenticated, deleteSupplier);
+router.get('/suppliers/:id/accounts', isAuthenticated, getSupplierAccounts);
+router.post('/suppliers/:id/accounts', isAuthenticated, linkSupplierAccountHandler);
+router.delete('/suppliers/:id/accounts/:accountId', isAuthenticated, unlinkSupplierAccountHandler);
+router.post('/suppliers/:id/peer-secret', isAuthenticated, generateSupplierPeerSecret);
 // ----------------------------------
 // 📦 PRODUCTOS
 // ----------------------------------
@@ -305,6 +311,7 @@ router.get('/movements/:productId',isAuthenticated, getMovementsByProduct);
 
 router.post("/registerProductionIntermediateFromPayload", isAuthenticated,registerProductionIntermediateFromPayload);
 router.post("/registerProductionFinalFromPayload", isAuthenticated,registerProductionFinalFromPayload);
+router.post("/productions/anular", isAuthenticated, anularProduccion);
 
 // ----------------------------------
 // 🍳 RECETAS (opcional)
@@ -364,10 +371,5 @@ router.get('/value-summary', isAuthenticated, getInventoryValueSummary);
 
 
 
-
-
-router.get('/suppliers/:id/accounts', isAuthenticated, getSupplierAccounts);
-router.post('/suppliers/:id/accounts', isAuthenticated, linkSupplierAccountHandler);
-router.delete('/suppliers/:id/accounts/:accountId', isAuthenticated, unlinkSupplierAccountHandler);
 
 export default router;

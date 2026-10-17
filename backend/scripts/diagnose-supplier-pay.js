@@ -3,10 +3,10 @@
  * Uso: node scripts/diagnose-supplier-pay.js [orderId]
  */
 import "dotenv/config";
-import "./src/database/registerEdDeliModels.js";
-import { sequelize } from "./src/database/connection.js";
-import { Expense } from "./src/models/Finance.js";
-import { Account } from "./src/models/Account.js";
+import "../src/database/registerEdDeliModels.js";
+import { sequelize } from "../src/database/connection.js";
+import { Expense } from "../src/models/Finance.js";
+import { Account } from "../src/models/Account.js";
 
 const orderId = Number(process.argv[2] || 15);
 

@@ -72,7 +72,7 @@ Account.belongsTo(Users, {
   targetKey: "id",
 });
 
-/** Alinea accounts con EdDeli/Tienda: columna isActive para login y gestión de usuarios. */
+/** Alinea accounts: columna isActive para login y gestión de usuarios. */
 export async function ensureAccountIsActiveColumn() {
   try {
     const [cols] = await sequelize.query(`SHOW COLUMNS FROM \`accounts\` LIKE 'isActive'`);

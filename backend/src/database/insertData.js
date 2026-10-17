@@ -6,6 +6,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 import { Roles } from "../models/Roles.js";
 import { Users } from "../models/Users.js";
 import { Account, AccountRoles } from "../models/Account.js";
+import { SupplierAccount } from "../models/SupplierAccount.js";
 import { sequelize } from "./connection.js";
 import { prepareTablesForRestore } from "./prepareTablesForRestore.js";
 import { repairJsonFieldValue, deserializeJsonFields } from "../utils/jsonFieldUtils.js";
@@ -97,6 +98,7 @@ export const BACKUP_TABLE_ENTRIES = [
   { key: "Users", model: Users },
   { key: "Account", model: Account },
   { key: "AccountRoles", model: AccountRoles },
+  { key: "SupplierAccount", model: SupplierAccount },
   { key: "UserData", model: UserData },
   { key: "Notifications", model: Notifications },
   { key: "NotificationProgram", model: NotificationProgram, sanitize: "NotificationProgram" },
@@ -496,10 +498,8 @@ export function prepareBackupForRestore(jsonData) {
       if (next.showPublicStoresVitrina === undefined || next.showPublicStoresVitrina === null) {
         next.showPublicStoresVitrina = true;
       }
-      // Multistock: si el backup no trae el flag, Store arranca en stock general.
-      if (next.multiStockEnabled === undefined || next.multiStockEnabled === null) {
-        next.multiStockEnabled = false;
-      }
+      // Store: un solo local (aunque el backup venga de Eddeli con multistock).
+      next.multiStockEnabled = false;
       return next;
     });
   }
@@ -568,6 +568,7 @@ export async function ensureBackupFileExists() {
     { id: 2, name: "Administrador" },
     { id: 3, name: "Empleado" },
     { id: 4, name: "Programador" },
+    { id: 5, name: "Proveedor" },
   ];
   const payload = JSON.stringify(empty, null, 2);
   await fs.writeFile(backupFilePath, payload, "utf8");
@@ -777,6 +778,7 @@ export async function listStoredBackups() {
       modifiedAt: st.mtime.toISOString(),
       counts: {},
       totalRows: null,
+      // Heurística: archivo con contenido. Validación real al fijar/subir/recargar.
       valid: st.size > 2,
     });
   }
