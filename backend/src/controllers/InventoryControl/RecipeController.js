@@ -148,6 +148,11 @@ export const getRecipeCosting = async (req, res) => {
       return productHasRecipe(raw.id);
     };
 
+    /**
+     * Convierte la cantidad configurada en la receta al multiplicador del hijo.
+     * - Masa/producto en unidades (unitId=1): gramos → fracción del lote; unidades → N lotes.
+     * - Masa/producto en gramos: gramos → g tal cual; unidades → N × peso del lote (o std).
+     */
     const resolveChildMult = async (raw, baseQty, isGr) => {
       if (raw.unitId === 1) {
         if (isGr) {
@@ -161,7 +166,12 @@ export const getRecipeCosting = async (req, res) => {
       }
       if (isGr) return baseQty;
       const std = Number(raw.standardWeightGrams || 0);
-      return baseQty * std;
+      if (std > 0) return baseQty * std;
+      if (await isComposedProduct(raw)) {
+        const { grams: batchGrams } = await computeProducedGrams(raw.id);
+        if (batchGrams > 0) return baseQty * batchGrams;
+      }
+      return baseQty;
     };
 
     const computeProducedGrams = async (productId) => {

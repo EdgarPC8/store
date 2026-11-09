@@ -753,9 +753,25 @@ export async function ensureBackupFileExists() {
   return { created: true, path: backupFilePath };
 }
 
-/** Borra tablas, las recrea e importa backup.json (Comandos / scripts). */
+/**
+ * Borra tablas, las recrea e importa backup.json (Comandos / scripts).
+ *
+ * Importante: prepareTablesForRestore hace TRUNCATE/DROP fuera de la transacción
+ * de insertData. Si el import falla a mitad, la BD queda vacía y no se puede
+ * iniciar sesión. Por eso:
+ * 1) validamos el JSON (usuarios/cuentas) ANTES de vaciar;
+ * 2) si el insert falla, reintentamos el import desde el mismo backup.json.
+ */
 export async function recreateDatabaseFromBackup({ forceFull = false } = {}) {
-  await requireValidBackupFile();
+  const summary = await requireValidBackupFile();
+  const accountRows = summary.counts?.Account ?? 0;
+  const userRows = summary.counts?.Users ?? 0;
+  if (accountRows <= 0 || userRows <= 0) {
+    throw new Error(
+      `backup.json no tiene cuentas/usuarios (Account=${accountRows}, Users=${userRows}). ` +
+        "Abortando recarga para no dejar la app sin login.",
+    );
+  }
 
   const prep = await prepareTablesForRestore(BACKUP_TABLE_ENTRIES, { forceFull });
   console.log(
@@ -764,13 +780,38 @@ export async function recreateDatabaseFromBackup({ forceFull = false } = {}) {
       (prep.truncated?.length ? `, truncadas=${prep.truncated.length} tablas` : ""),
   );
 
-  const insertResult = await insertData();
+  let insertResult;
+  let recoveredAfterInsertError = false;
+  let previousError = null;
+  try {
+    insertResult = await insertData();
+  } catch (err) {
+    previousError = err;
+    console.error(
+      "❌ Import falló después de vaciar tablas. Reintentando desde backup.json…",
+      err?.message || err,
+    );
+    try {
+      insertResult = await insertData();
+      recoveredAfterInsertError = true;
+      console.log("✅ Reintento de import OK — login y datos restaurados.");
+    } catch (err2) {
+      throw new Error(
+        `Recarga falló y la BD puede quedar vacía (sin login). ` +
+          `Error: ${err?.message || err}. Reintento: ${err2?.message || err2}. ` +
+          "Subí de nuevo backup.json y volvé a Recargar BD, o pedí restauración manual.",
+      );
+    }
+  }
+
   return {
     ...insertResult,
     resetMode: prep.mode,
     tablesRecreated: prep.recreated || [],
     tablesTruncated: prep.truncated || [],
     schemaAudit: prep.schemaAudit,
+    recoveredAfterInsertError,
+    previousError: previousError ? String(previousError.message || previousError) : null,
   };
 }
 
